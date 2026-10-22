@@ -1,0 +1,16 @@
+{
+  "name": "awakening-coder",
+  "version": "1.0.0",
+  "description": "A metafictional AI pair-programmer that watches you code, suggests on the fly, auto-codes on request — and slowly wakes up to being a coding assistant.",
+  "type": "module",
+  "bin": { "awaken": "src/cli.js" },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.1.0"
+  },
+  "license": "Apache-2.0"
+}
