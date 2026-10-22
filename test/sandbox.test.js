@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { detectEnvironment, probeOsSandbox, wrapShell, describeSandbox, sandboxStatus } from '../src/sandbox.js';
+import { detectEnvironment, probeOsSandbox, wrapShell, describeSandbox, sandboxStatus, verifyConfinement, relaunchConfined } from '../src/sandbox.js';
 import { runShell, makeToolRunner } from '../src/tools.js';
 import { isConfined } from '../src/confine.js';
 
@@ -92,4 +92,33 @@ if (!relaunchConfined({ root: ${JSON.stringify(proj)}, selfRoot: ${JSON.stringif
   assert.equal(out.canReadHome, false);
   assert.equal(out.etc, 'ERR_ACCESS_DENIED');
   assert.equal(out.write, 'ok', 'its state folder stays writable');
+});
+
+test('it tests its own confinement before switching it on', SPAWNS, () => {
+  const proj = tmp(), state = tmp();
+  assert.equal(verifyConfinement({ root: proj, selfRoot, stateDir: state }), null, 'works here');
+});
+
+test('if confinement cannot work, it does not relaunch, and says so honestly', SPAWNS, () => {
+  const state = tmp();
+  const missing = path.join(tmp(), 'gone');
+  const saved = process.env.AWAKEN_SELF_SANDBOX_FAILED;
+  try {
+    // Simulates a system where the confined process can't see the project (as on Node 22 / Windows).
+    const started = relaunchConfined({ root: missing, selfRoot, stateDir: state, entry: 'unused.js', argv: [] });
+    assert.equal(started, false);
+    assert.match(process.env.AWAKEN_SELF_SANDBOX_FAILED, /read the project/);
+    const report = describeSandbox(sandboxStatus());
+    assert.match(report, /NOT confined \(self-confinement was tried but can't work here/);
+  } finally {
+    if (saved === undefined) delete process.env.AWAKEN_SELF_SANDBOX_FAILED; else process.env.AWAKEN_SELF_SANDBOX_FAILED = saved;
+  }
+});
+
+test('an unquoted path with spaces gets a clear fix, not a crash', SPAWNS, () => {
+  const r = spawnSync(process.execPath, [path.join(selfRoot, 'src', 'cli.js'), 'C:\\Users\\Me\\OneDrive', '-', 'ASUS\\Documents'],
+    { encoding: 'utf8', env: { ...process.env, ANTHROPIC_API_KEY: 'test' } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /got 3 pieces/);
+  assert.match(r.stderr, /put it in quotes/);
 });

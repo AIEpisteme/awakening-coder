@@ -140,10 +140,61 @@ export function selfConfinement() {
  * Re-launch this program confined, unless it already is (or confinement is disabled).
  * Returns true if a confined child was started — the caller must then do nothing else.
  */
+// What the confined process must be able to do, checked in a throwaway confined process first.
+const PROBE = `
+const fs = require('node:fs'), path = require('node:path');
+const { root, selfRoot, stateDir, outside } = JSON.parse(process.env.AWAKEN_PROBE);
+const step = (name, fn) => { try { fn(); } catch (e) { console.log(name + ': ' + (e.code || e.message)); process.exit(3); } };
+step('read the project', () => { if (!fs.existsSync(root)) throw new Error('missing'); fs.readdirSync(root); });
+step('read its own code', () => fs.readdirSync(path.join(selfRoot, 'src')));
+step('write its state folder', () => { const f = path.join(stateDir, '.probe'); fs.writeFileSync(f, 'ok'); fs.rmSync(f); });
+step('refuse files outside its folders', () => {
+  if (!outside) return;
+  let denied = false;
+  try { fs.readFileSync(outside); } catch (e) { denied = e.code === 'ERR_ACCESS_DENIED'; }
+  if (!denied) throw new Error('confinement did not take effect');
+});
+console.log('ok');`;
+
+/**
+ * Check that a confined copy of us could actually work: read the project and its own code, write
+ * its state folder, and still be confined. Returns null if it works, else a plain reason.
+ * (Some Node/OS combinations mis-match allowed paths — e.g. Windows long-path forms — so we test
+ * instead of assuming.)
+ */
+export function verifyConfinement({ root, selfRoot, stateDir }) {
+  // A canary file outside every allowed folder: the confined probe must NOT be able to read it.
+  let outside = null, canaryDir = null;
+  try {
+    canaryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'awaken-canary-'));
+    const c = real(canaryDir);
+    if (![root, selfRoot, stateDir].some((p) => inside(c, real(p)))) { outside = path.join(c, 'canary.txt'); fs.writeFileSync(outside, 'x'); }
+  } catch { outside = null; }
+  let r;
+  try {
+    r = spawnSync(process.execPath, [...selfSandboxFlags({ root, selfRoot, stateDir }), '-e', PROBE], {
+      encoding: 'utf8', timeout: 15_000, env: { ...process.env, AWAKEN_PROBE: JSON.stringify({ root, selfRoot, stateDir, outside }) },
+    });
+  } finally {
+    if (canaryDir) fs.rmSync(canaryDir, { recursive: true, force: true });
+  }
+  if (r.status === 0 && r.stdout.trim().endsWith('ok')) return null;
+  const why = (r.stdout || r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').at(-1).slice(0, 200);
+  return `Node ${process.version}'s permission model failed the startup check on ${process.platform} (could not ${why})`;
+}
+
+/**
+ * Re-launch this program confined, unless it already is (or confinement is disabled).
+ * Returns true if a confined child was started — the caller must then do nothing else.
+ * If confinement can't work on this system, it does NOT relaunch: it records why in
+ * AWAKEN_SELF_SANDBOX_FAILED, so the status report (and the model) say so honestly.
+ */
 export function relaunchConfined({ root, selfRoot, stateDir, entry, argv }) {
   if (process.permission) return false; // already confined
   if (process.env.AWAKEN_SELF_SANDBOXED === '1') return false; // a relaunch that didn't take; don't loop
   fs.mkdirSync(stateDir, { recursive: true });
+  const failed = verifyConfinement({ root, selfRoot, stateDir });
+  if (failed) { process.env.AWAKEN_SELF_SANDBOX_FAILED = failed; return false; }
   // Detection needs to read /proc, /sys and $PATH, which the confined child can't — do it here and hand it over.
   const info = { environment: detectEnvironment(), os: probeOsSandbox() };
   const child = spawn(process.execPath, [...selfSandboxFlags({ root, selfRoot, stateDir }), entry, ...argv], {
@@ -167,6 +218,7 @@ export function sandboxStatus({ allowNet = false, disabled = false } = {}) {
     os: disabled ? null : info.os ?? null,
     allowNet,
     disabled,
+    failed: process.permission ? null : process.env.AWAKEN_SELF_SANDBOX_FAILED || null,
   };
 }
 
@@ -181,7 +233,7 @@ export function describeSandbox(s) {
   ].filter(Boolean).join(', ') || 'directly on the host machine, as far as it can tell (no container or VM detected)';
   const self = s.self.active
     ? `confined by Node's permission model — it can read only the project, its own code and its state folder, and write only the project and its state folder${s.self.canReadHome ? ' (WARNING: home directory is readable)' : ''}`
-    : `NOT confined${s.disabled ? ' (sandboxing was turned off with --no-sandbox)' : ''} — it runs with the user's full file access`;
+    : `NOT confined${s.disabled ? ' (sandboxing was turned off with --no-sandbox)' : s.failed ? ` (self-confinement was tried but can't work here: ${s.failed})` : ''} — it runs with the user's full file access`;
   const shell = s.os
     ? `isolated with ${s.os.kind === 'bwrap' ? 'bubblewrap' : 'macOS sandbox-exec'}: read-only system, writable project only, home directory and secret folders hidden, ${s.allowNet ? 'network allowed (--net)' : 'no network'}`
     : `NOT isolated (${s.disabled ? 'sandboxing was turned off with --no-sandbox' : 'no OS sandbox available'}) — every command that executes code needs the developer's approval, even with --yes`;

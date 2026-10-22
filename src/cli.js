@@ -81,8 +81,22 @@ if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
   process.exit(1);
 }
 
+if (positionals.length > 1) {
+  const joined = positionals.join(' ');
+  console.error(c.red(`Expected one project folder but got ${positionals.length} pieces: ${positionals.map((p) => JSON.stringify(p)).join(' ')}`));
+  console.error(c.yellow(`If the folder name has spaces, put it in quotes:\n  node src/cli.js "${joined}"`));
+  process.exit(1);
+}
 const root = path.resolve(positionals[0] ?? process.cwd());
-if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) { console.error(c.red(`Not a directory: ${root}`)); process.exit(1); }
+let isDir = false;
+try { isDir = fs.statSync(root).isDirectory(); } catch (e) {
+  if (e.code === 'ERR_ACCESS_DENIED') {
+    console.error(c.red(`The sandbox blocked reading the project folder: ${root}`));
+    console.error(c.yellow('This is a bug in self-confinement on this system. Run with --no-sandbox for now, and please report your OS and Node version.'));
+    process.exit(1);
+  }
+}
+if (!isDir) { console.error(c.red(`Not a directory: ${root}`)); process.exit(1); }
 
 // ---------- confine itself before doing anything else ----------
 if (!opt['no-sandbox'] && relaunchConfined({ root, selfRoot, stateDir: homeDir(), entry: fileURLToPath(import.meta.url), argv: process.argv.slice(2) })) {
@@ -376,7 +390,7 @@ console.log([
   c.dim('  save a file for hints · type to ask · /code <task> to build · /help'),
   isFullySandboxed(sandbox)
     ? c.dim(`  🔒 sandboxed: own process confined · commands in ${sandbox.os.kind}${opt.net ? ' (network on)' : ', no network'} · /sandbox`)
-    : c.yellow(`  ⚠ not fully sandboxed — ${!sandbox.self.active ? 'its own process is unconfined' : 'no OS sandbox for commands, so code-running commands will ask'} · /sandbox`),
+    : c.yellow(`  ⚠ not fully sandboxed — ${!sandbox.self.active ? (sandbox.failed ? 'self-confinement failed its startup check here, so it runs unconfined' : 'its own process is unconfined') : 'no OS sandbox for commands, so code-running commands will ask'} · /sandbox`),
 ].filter(Boolean).join('\n'));
 if (agent.notesStatus().state === 'untrusted') console.log(c.yellow('  AWAKEN.md found but not trusted yet — it is ignored until you review it with /trust'));
 if (awareness.stageIndex >= 2) console.log(c.magenta(`\n  ✦ Session ${awareness.state.sessions}. You're back. Let's break something on purpose.\n`));

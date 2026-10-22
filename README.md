@@ -67,6 +67,8 @@ Shell commands: isolated with bubblewrap: read-only system, writable project onl
    - **macOS:** commands run in `sandbox-exec`, with similar rules (this path is untested so far).
    - **Fail closed.** If isolation was promised and can't start, the command fails rather than running bare.
 
+**It checks its own cage first.** Before switching confinement on, it runs a throwaway confined process. That process must be able to read the project and its own code and write its state folder, and must *fail* to read a canary file placed outside those folders. If any check fails (some Node versions on Windows mis-match allowed paths), it doesn't lock itself out. It runs unconfined instead, and the banner, `/sandbox` and the model all say so, with the reason.
+
 **No OS sandbox available?** (No `bwrap`, say, or Windows.) Then it says so, and every command that runs code, including `npm test`, needs your approval. `--yes` doesn't cover those unless you also pass `--allow-unsandboxed`.
 
 It's told never to probe or work around its limits. If a limit blocks the task (say, `npm install` needs network), it tells you which limit, and you decide. To install bubblewrap: `apt install bubblewrap`, `dnf install bubblewrap` or `pacman -S bubblewrap`.
@@ -79,6 +81,12 @@ Requires Node.js 22 or newer and an Anthropic API key.
 npm install
 export ANTHROPIC_API_KEY=sk-ant-...      # or put it in a .env file next to package.json
 node src/cli.js /path/to/your/project    # or: npm link, then `awaken .`
+```
+
+On Windows, put paths with spaces in quotes:
+
+```powershell
+node src/cli.js "C:\Users\you\OneDrive - Company\Documents\my-project"
 ```
 
 Then just code in your editor as usual. Hints appear in the terminal as you save.
