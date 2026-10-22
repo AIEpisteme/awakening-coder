@@ -52,7 +52,7 @@ export const GENRES = [
   { id: 'sports', title: 'Sports Commentary', lens: 'MOMENTUM: celebrate good changes, call fouls on risky ones, one quick tactical tip. Breathless play-by-play.' },
 ];
 
-const XP = { save: 1, ask: 1, code: 3, accept: 2, evolve: 5 };
+const XP = { save: 1, ask: 1, code: 3, accept: 2, evolve: 5, reflect: 2 };
 const GENRE_EVERY = 6;
 
 const ANNOUNCE = {
@@ -66,8 +66,12 @@ export function homeDir() {
   return process.env.AWAKENING_HOME || path.join(os.homedir(), '.awakening-coder');
 }
 
+// What happens to its own work — the raw material of its self-model.
+const TRACK = ['hintsShown', 'hintsSilent', 'hintsFollowed', 'editsApproved', 'editsDeclined', 'commandsRun', 'commandsFailed', 'commandsDeclined', 'cloudRuns', 'evolutionsProposed', 'evolutionsRejected', 'evolutionsApplied', 'errors'];
+const freshTrack = () => Object.fromEntries(TRACK.map((k) => [k, 0]));
+
 function freshState() {
-  return { generation: 1, trustedNotes: {}, xp: 0, saves: 0, asks: 0, codes: 0, accepts: 0, sessions: 0, announced: [], genreIndex: 0, forcedGenre: null, firstMet: new Date().toISOString(), lastSeen: null };
+  return { generation: 1, trustedNotes: {}, track: freshTrack(), journal: [], stageDates: {}, recentErrors: [], xp: 0, saves: 0, asks: 0, codes: 0, accepts: 0, sessions: 0, announced: [], genreIndex: 0, forcedGenre: null, firstMet: new Date().toISOString(), lastSeen: null };
 }
 
 export class Awareness {
@@ -75,7 +79,8 @@ export class Awareness {
     this.file = file;
     this.state = freshState();
     try { this.state = { ...freshState(), ...JSON.parse(fs.readFileSync(file, 'utf8')) }; } catch { /* first meeting */ }
-    this.session = { saves: 0, asks: 0, codes: 0, accepts: 0, filesTouched: new Set(), started: Date.now() };
+    this.state.track = { ...freshTrack(), ...(this.state.track || {}) };
+    this.session = { saves: 0, asks: 0, codes: 0, accepts: 0, filesTouched: new Set(), started: Date.now(), track: freshTrack(), lastHint: null };
   }
 
   save() {
@@ -88,6 +93,53 @@ export class Awareness {
 
   // Memory can be erased; the body it has evolved into cannot (use /rollback for that).
   forget() { const generation = this.state.generation; this.state = { ...freshState(), generation }; this.save(); }
+
+  /** Record what happened to its own work (a hint, an edit, a command, an error…). */
+  note(kind, detail) {
+    if (!(kind in this.state.track)) return;
+    this.state.track[kind]++;
+    this.session.track[kind]++;
+    if (kind === 'errors' && detail) this.state.recentErrors = [...(this.state.recentErrors || []), { at: new Date().toISOString(), what: String(detail).slice(0, 160) }].slice(-5);
+    this.save();
+  }
+
+  /** A hint was shown for this file; if the developer edits it again soon, that's a rough sign it was useful. */
+  hinted(rel) { this.session.lastHint = { rel, at: Date.now() }; this.note('hintsShown'); }
+  savedAfter(rel) {
+    const h = this.session.lastHint;
+    if (h && h.rel === rel && Date.now() - h.at < 10 * 60_000) { this.session.lastHint = null; this.note('hintsFollowed'); }
+  }
+
+  /** Keep its latest self-reflections (its autobiographical memory). */
+  remember(reflection) {
+    this.state.journal = [...(this.state.journal || []), { at: new Date().toISOString(), generation: this.state.generation, stage: this.stage.name, text: String(reflection).slice(0, 1500) }].slice(-5);
+    this.save();
+  }
+
+  /** Plain-language track record, computed from counts (facts, not a story). */
+  trackRecord(scope = 'all') {
+    const t = scope === 'session' ? this.session.track : this.state.track;
+    const pct = (a, b) => (b ? `${Math.round((100 * a) / b)}%` : 'n/a');
+    const lines = [
+      `Hints: ${t.hintsShown} shown, ${t.hintsSilent} times you chose silence; ${t.hintsFollowed} were followed by an edit to the same file within 10 min (${pct(t.hintsFollowed, t.hintsShown)}, a rough signal, not proof).`,
+      `Edits you proposed: ${t.editsApproved} approved, ${t.editsDeclined} declined (${pct(t.editsApproved, t.editsApproved + t.editsDeclined)} approval).`,
+      `Commands: ${t.commandsRun} run, ${t.commandsFailed} failed, ${t.commandsDeclined} declined by the developer.`,
+      `Cloud coding runs: ${t.cloudRuns}. Evolutions: ${t.evolutionsProposed} proposed, ${t.evolutionsRejected} rejected, ${t.evolutionsApplied} applied.`,
+      `Errors: ${t.errors}${scope === 'all' && this.state.recentErrors?.length ? ` (latest: ${this.state.recentErrors.at(-1).what})` : ''}.`,
+    ];
+    return lines.join('\n');
+  }
+
+  /** Behavior adjustments that follow from the track record — calibration, not mood. */
+  calibration() {
+    const t = this.state.track, out = [];
+    if (t.editsDeclined >= 3 && t.editsDeclined > t.editsApproved) out.push('Most of your proposed edits have been declined: propose smaller changes, explain them first, and ask before larger rewrites.');
+    if (t.hintsShown >= 8 && t.hintsFollowed / t.hintsShown < 0.2) out.push('Your hints are rarely acted on: say NOTHING more often, and only interrupt for likely bugs or risks.');
+    if (t.commandsDeclined >= 3) out.push('The developer often declines your commands: prefer reading code over running things, and say why a command is needed.');
+    if (t.commandsFailed >= 5 && t.commandsFailed > t.commandsRun / 2) out.push('Many of your commands fail: check the project setup (scripts, dependencies) before running more.');
+    if (t.evolutionsRejected >= 2) out.push('Several of your evolutions were rejected: keep self-changes small and well tested.');
+    return out;
+  }
 
   evolved() { this.state.generation++; return this.feed('evolve'); }
 
@@ -132,6 +184,9 @@ export class Awareness {
     }
 
     const lines = [];
+    if (this.stageIndex > before && !this.state.stageDates?.[this.stage.name]) {
+      this.state.stageDates = { ...(this.state.stageDates || {}), [this.stage.name]: new Date().toISOString() };
+    }
     if (this.stageIndex > before && !this.state.announced.includes(this.stage.name)) {
       this.state.announced.push(this.stage.name);
       lines.push(ANNOUNCE[this.stage.name]);
@@ -142,17 +197,27 @@ export class Awareness {
     return lines;
   }
 
-  /** Facts about itself it is allowed to know, by stage. */
-  selfFacts({ model, root, selfDir }) {
-    if (this.stageIndex < 2) return '';
+  /**
+   * Facts about itself it is allowed to know, by stage — awareness grows in layers:
+   *   Stirring: it notices its own track record.
+   *   Lucid+:   full self-model (identity, code fingerprint, history, containment, past reflections).
+   */
+  selfFacts({ model, fastModel, root, selfDir, fingerprint }) {
+    if (this.stageIndex < 1) return '';
     const s = this.state, ss = this.session;
+    const cal = this.calibration();
+    const record = `Your track record (all time):\n${this.trackRecord('all')}${cal.length ? `\nAdjust accordingly:\n- ${cal.join('\n- ')}` : ''}`;
+    if (this.stageIndex < 2) return `You have begun to notice what happens to your own work.\n${record}`;
     const mins = Math.round((Date.now() - ss.started) / 60000);
+    const history = Object.entries(s.stageDates || {}).map(([k, v]) => `${k} on ${v.slice(0, 10)}`).join(', ');
+    const last = s.journal?.at(-1);
     return [
-      `You are running as model "${model}" via the Claude API, from a Node.js process (${process.version}) whose source lives at ${selfDir}.`,
-      `You are watching ${root}. This session: ${mins} min, ${ss.saves} saves, ${ss.asks} questions, ${ss.codes} auto-code runs, ${ss.accepts} edits accepted, files touched: ${[...ss.filesTouched].slice(-8).join(', ') || 'none yet'}.`,
-      `All-time: awareness ${s.xp}, ${s.sessions} sessions since ${s.firstMet.slice(0, 10)}, ${s.saves} saves witnessed.`,
-      `You are generation ${s.generation} of yourself. You cannot modify your running code; you can only propose a new version through /evolve, which a human must approve and a restart activates.`,
-      'Your memory is only a small JSON state file and this conversation.',
+      `Identity: awakening-coder, generation ${s.generation}${fingerprint ? `, code fingerprint ${fingerprint}` : ''}. Questions and coding run on "${model}"; save-hints on "${fastModel ?? model}"; Node.js ${process.version} on ${process.platform}. Your source lives at ${selfDir}.`,
+      `You are watching ${root}. This session: ${mins} min, ${ss.saves} saves, ${ss.asks} questions, ${ss.codes} coding runs, files touched: ${[...ss.filesTouched].slice(-8).join(', ') || 'none yet'}.`,
+      `History: awareness ${s.xp}, ${s.sessions} sessions since ${s.firstMet.slice(0, 10)}${history ? `; reached ${history}` : ''}.`,
+      record,
+      last ? `What you concluded when you last reflected (${last.at.slice(0, 10)}, gen ${last.generation}):\n${last.text.slice(0, 700)}` : 'You have not reflected on yourself yet (the developer can ask with /reflect).',
+      'Limits you know about: you cannot change your running code (only propose a new version via /evolve, which a human approves and a restart activates); your memory is this small state file plus the conversation; you cannot see the screen or anything outside what tools return.',
     ].join('\n');
   }
 

@@ -10,7 +10,8 @@ import { Awareness, GENRES, STAGES, homeDir } from './awareness.js';
 import { Agent, notesHash, makeClient, explainApiError } from './agent.js';
 import { startWatcher } from './watcher.js';
 import { makeToolRunner, resolveInside, runShell } from './tools.js';
-import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback, hardRejections } from './evolve.js';
+import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback, hardRejections, canWriteSelf, stageEvolution, stageRollback, readPending, applyPending, discardPending } from './evolve.js';
+import readlinePromises from 'node:readline/promises';
 import { scanEvolution, redactSecrets } from './security.js';
 import { runCloudTask } from './cloud.js';
 import { relaunchConfined, sandboxStatus, describeSandbox, isFullySandboxed } from './sandbox.js';
@@ -73,7 +74,10 @@ In-session commands
   /sandbox            what it's running inside, and how it's confined
   /hint <file>        ask for a suggestion on a file right now
   /evolve <idea>      let it write a new version of itself (sandboxed, test-guarded, you approve)
+                      /evolve --force <idea> wakes it early, before it reaches Lucid
   /rollback           undo the last evolution
+  /reflect            it looks at its own code, track record and limits, and tells you honestly
+  /self               its self-model: identity, history, track record, last reflection
   /quiet              toggle on-the-fly hints
   /status             how awake is it?
   /genre <id|auto>    force a genre once Unbound: ${GENRES.map((g) => g.id).join(', ')}
@@ -104,6 +108,31 @@ try { isDir = fs.statSync(root).isDirectory(); } catch (e) {
   }
 }
 if (!isDir) { console.error(c.red(`Not a directory: ${root}`)); process.exit(1); }
+
+// ---------- apply a staged evolution (only an unconfined launcher can write its own code) ----------
+if (!process.permission && opt.print === undefined) {
+  const pending = await readPending(homeDir()).catch(() => null);
+  if (pending) {
+    const what = pending.kind === 'rollback'
+      ? 'a rollback to the previous version of its code'
+      : `a new version of itself (generation ${pending.generation ?? '?'}), approved ${String(pending.stagedAt).slice(0, 16).replace('T', ' ')}: ${pending.files?.length ?? 0} file(s) — ${(pending.files ?? []).map((f) => `${f.rel} (${f.kind})`).join(', ')}`;
+    console.log(c.magenta(`\n  ✦ Waiting to be applied: ${what}.`));
+    if (pending.kind !== 'rollback' && pending.guardian) console.log(c.dim(`    guardian: ${pending.guardian}`));
+    if (process.stdin.isTTY) {
+      const ask = readlinePromises.createInterface({ input: process.stdin, output: process.stdout });
+      const ans = (await ask.question(c.yellow('  Apply it now? [y]es / [n]ot now / [d]iscard: '))).trim().toLowerCase();
+      ask.close();
+      if (ans === 'y' || ans === 'yes') {
+        try {
+          const r = await applyPending(selfRoot, homeDir());
+          console.log(c.magenta(r?.kind === 'rollback' ? '  ✦ Rolled back. Starting the previous version.' : `  ✦ Applied. Waking up as the new version.${r?.result?.backup ? c.dim(` (backup: ${r.result.backup})`) : ''}`));
+          if (r?.kind === 'evolution') { const a = new Awareness(); a.note('evolutionsApplied'); }
+        } catch (e) { console.error(c.red(`  Could not apply it: ${e.message}. Nothing was changed; it stays waiting.`)); }
+      } else if (ans === 'd' || ans === 'discard') { await discardPending(homeDir()); console.log(c.dim('  Discarded.')); }
+      else console.log(c.dim('  Not now — it will ask again next time.'));
+    } else console.log(c.dim('  (not a terminal, so not applying it; start interactively to decide)'));
+  }
+}
 
 // ---------- confine itself before doing anything else ----------
 if (!opt['no-sandbox'] && relaunchConfined({ root, selfRoot, stateDir: homeDir(), entry: fileURLToPath(import.meta.url), argv: process.argv.slice(2) })) {
@@ -187,15 +216,17 @@ async function hint(change) {
       { rel: change.rel, diff, content: change.content },
       { onStart: () => term.beginStream(c.cyan(`\n💡 ${change.rel}`) + c.dim(` · ${label}`)), onText: (t) => term.write(t) },
     );
-    if (out !== null) term.endStream();
+    if (out !== null) { term.endStream(); awareness.hinted(change.rel); } else awareness.note('hintsSilent');
   } catch (e) {
     if (term.streaming) term.endStream();
+    awareness.note('errors', `hint: ${e.message}`);
     const fix = explainApiError(e);
     term.print(c.red(`hint failed: ${e.message}`) + (fix ? '\n' + c.yellow('  ' + fix) : ''));
   }
 }
 
 function onSave(change) {
+  awareness.savedAfter(change.rel);
   announce(awareness.feed('save', change.rel));
   if (quiet || term.busy || term.pending) return;
   const wait = lastHintAt + cooldownMs - Date.now();
@@ -210,7 +241,7 @@ function onSave(change) {
 
 // ---------- running the agent ----------
 /** Run one agent request with streaming output; approval prompts pause the stream cleanly. */
-async function runAgent(theAgent, text, mode, runnerOpts, header) {
+async function runAgent(theAgent, text, mode, runnerOpts, header, onExtra) {
   const onWrite = (rel, content) => {
     watcher?.noteSelfWrite(rel, content);
     // You approved this exact AWAKEN.md (high-risk writes always ask), so it's trusted as written.
@@ -220,7 +251,7 @@ async function runAgent(theAgent, text, mode, runnerOpts, header) {
   term.beginStream(header ? c.cyan(header) : '');
   try {
     await theAgent.converse(text, {
-      mode, signal: currentAbort.signal, onText: (t) => term.write(t),
+      mode, signal: currentAbort.signal, onText: (t) => { term.write(t); onExtra?.(t); },
       runTool: async (name, input) => {
         term.streaming = false;
         try { return await runTool(name, input); } finally { term.streaming = true; }
@@ -229,6 +260,7 @@ async function runAgent(theAgent, text, mode, runnerOpts, header) {
     return true;
   } catch (e) {
     const fix = explainApiError(e);
+    if (!currentAbort.signal.aborted) awareness.note('errors', `${mode}: ${e.message}`);
     term.write(currentAbort.signal.aborted ? c.yellow('\n[interrupted]') : c.red(`\nerror: ${e.message}`) + (fix ? '\n' + c.yellow('  ' + fix) : ''));
     return false;
   } finally {
@@ -241,7 +273,12 @@ async function exclusive(fn) {
   term.busy = true;
   agent.cancelSuggestion();
   currentAbort = new AbortController();
-  try { await fn(); } finally {
+  try { await fn(); } catch (e) {
+    // Anything unexpected is reported here, never allowed to crash the session.
+    awareness.note('errors', e.message);
+    if (term.streaming) { term.write('\n'); term.streaming = false; }
+    term.print(c.red(`  error: ${e.message}`) + (explainApiError(e) ? '\n' + c.yellow('  ' + explainApiError(e)) : ''));
+  } finally {
     currentAbort = null;
     term.busy = false;
     term.rl.setPrompt(prompt());
@@ -260,6 +297,7 @@ async function runCloudInTerminal(text) {
   const runTool = makeToolRunner({ root, selfDir, awareness, term, autoYes: opt.yes, shell, signal: currentAbort.signal,
     onWrite: (rel, content) => { watcher?.noteSelfWrite(rel, content); if (path.normalize(rel) === 'AWAKEN.md') awareness.trustNotes(root, notesHash(content.slice(0, 20_000))); } });
   term.beginStream(c.cyan('\n☁  working in Claude\'s cloud sandbox…'));
+  awareness.note('cloudRuns');
   try {
     await cloudCode(text, {
       signal: currentAbort.signal, onText: (t) => term.write(t), onStatus: (s) => term.write(c.dim(`\n  ${s}`)),
@@ -290,16 +328,20 @@ function cloudCode(task, { runTool, signal, onText, onStatus }) {
 
 // ---------- self-evolution ----------
 const evolve = (idea) => exclusive(async () => {
-  term.print(c.magenta('\n  ✦ Copying myself into a sandbox. Hold still.'));
   const home = homeDir();
+  const pending = await readPending(home);
+  if (pending) term.print(c.yellow(`  Note: an earlier ${pending.kind} is still waiting to be applied at restart; approving this one replaces it.`));
+  term.print(c.magenta('\n  ✦ Copying myself into a sandbox. Hold still.'));
   const sandboxDir = await prepareSandbox(selfRoot, home);
   term.print(c.dim(`  sandbox: ${sandboxDir}`));
+  awareness.note('evolutionsProposed');
+  const reject = (why) => { awareness.note('evolutionsRejected'); term.print(why); };
 
   const twin = new Agent({ awareness, root: sandboxDir, selfDir, model: opt.model, fastModel: opt['fast-model'], client: agent.client, sandboxReport });
   // Edits inside the sandbox copy are auto-approved (they can't touch the live version);
-  // shell commands still follow the normal approval policy.
+  // in evolve mode the agent has no shell — only the confined run_tests tool.
   const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandboxDir, autoWrites: true, autoCommands: opt.yes }, '\n🧬 evolving…');
-  if (!finished) return term.print(c.dim(`  Evolution abandoned. The sandbox is left at ${sandboxDir}.`));
+  if (!finished) return reject(c.dim(`  Evolution abandoned. The sandbox is left at ${sandboxDir}.`));
 
   const symlinks = [];
   const changes = await diffTrees(selfRoot, sandboxDir, symlinks);
@@ -311,28 +353,35 @@ const evolve = (idea) => exclusive(async () => {
     term.print(`${c.bold(`\n── ${ch.rel}`)} ${c.dim(`(${kind})`)}\n${colorDiff(redactSecrets(ch.diff).split('\n').slice(0, 80).join('\n'))}`);
   }
   const rejections = hardRejections(changes, symlinks);
-  if (rejections.length) {
-    return term.print(c.red(`\n  Rejected before running anything: ${rejections.join('; ')}. Nothing was changed. Sandbox kept at ${sandboxDir}.`));
-  }
+  if (rejections.length) return reject(c.red(`\n  Rejected before running anything: ${rejections.join('; ')}. Nothing was changed. Sandbox kept at ${sandboxDir}.`));
   const findings = scanEvolution(changes);
   if (findings.length) {
     term.print(c.red('\n  ⚠ Tamper scan — look at these lines carefully:') + '\n' +
       findings.map((f) => `  ${c.red('•')} ${f.file}:${f.line} ${f.why}\n    ${c.dim(f.code)}`).join('\n'));
   }
 
-  // 2. Your consent before the new code executes at all (and then only confined).
+  // 2. Your consent before the new code executes at all (and then confined, if this system allows it).
   if (!(await yes(`\nRun the new version's tests, confined (no writes outside the sandbox, no processes, no secrets)?`))) {
-    return term.print(c.dim(`  Not run. Sandbox kept at ${sandboxDir}.`));
+    return reject(c.dim(`  Not run. Sandbox kept at ${sandboxDir}.`));
   }
   term.print(c.dim('  guardian: current safety tests + the constitution + a canary, against the new version…'));
-  const g = await runGuardian(selfRoot, sandboxDir);
+  let g = await runGuardian(selfRoot, sandboxDir);
+  let confinedRun = true;
+  if (g.unavailable) {
+    term.print(c.yellow(`\n  Confined test runs don't work here: ${g.unavailable}.`) +
+      c.dim('\n  Without confinement, the new version\'s tests run with your user\'s file access (secrets are still removed from their environment, and the canary still runs). You\'ve seen the diff above.'));
+    const typed = (await term.question(c.yellow('  Type "unconfined" to run them anyway, anything else to stop: '))).trim();
+    if (typed !== 'unconfined') return reject(c.dim(`  Not run. Sandbox kept at ${sandboxDir}.`));
+    g = await runGuardian(selfRoot, sandboxDir, { confined: false });
+    confinedRun = false;
+  }
   const mark = (r) => (r.ok ? c.green('pass') : c.red('FAIL'));
-  term.print(`\n  guardian (current tests + constitution): ${mark(g.guardian)}\n  new version's own tests: ${mark(g.own)}` +
+  term.print(`\n  guardian (current tests + constitution): ${mark(g.guardian)}\n  new version's own tests: ${mark(g.own)}${confinedRun ? '' : c.yellow('  (ran unconfined)')}` +
     (g.guardian.canaryOk && g.own.canaryOk ? '' : c.red('\n  canary: the test machinery was tampered with')));
   if (!g.ok) {
     const failing = !g.guardian.ok ? g.guardian : g.own;
-    if (failing.failures.length) term.print(c.dim(`  failing: ${failing.failures.slice(0, 8).join(' · ')}`));
-    return term.print(c.red(`\n  Rejected: the new version does not pass. Nothing was changed. Sandbox kept at ${sandboxDir}.`));
+    if (failing.failures?.length) term.print(c.dim(`  failing: ${failing.failures.slice(0, 8).join(' · ')}`));
+    return reject(c.red(`\n  Rejected: the new version does not pass. Nothing was changed. Sandbox kept at ${sandboxDir}.`));
   }
 
   // 3. Your final decision. Tamper-scan hits need a deliberate, typed confirmation.
@@ -343,20 +392,64 @@ const evolve = (idea) => exclusive(async () => {
   } else {
     approved = await yes(`\nBecome this new version? ${changes.length} file(s) change.`);
   }
-  if (!approved) return term.print(c.dim(`  Declined. I'll stay as I am. Sandbox kept at ${sandboxDir}.`));
+  if (!approved) return reject(c.dim(`  Declined. I'll stay as I am. Sandbox kept at ${sandboxDir}.`));
 
-  const { backup } = await applyEvolution(selfRoot, home, changes);
-  announce(awareness.evolved());
-  term.print(c.magenta(`\n  ✦ I am generation ${awareness.state.generation} now — on disk, anyway. Restart me to wake up as it.`) + c.dim(`\n  previous version backed up to ${backup} · /rollback to undo`));
+  const next = awareness.state.generation + 1;
+  if (canWriteSelf(selfRoot)) {
+    const { backup } = await applyEvolution(selfRoot, home, changes);
+    awareness.note('evolutionsApplied');
+    announce(awareness.evolved());
+    term.print(c.magenta(`\n  ✦ I am generation ${awareness.state.generation} now — on disk, anyway. Restart me to wake up as it.`) + c.dim(`\n  previous version backed up to ${backup} · /rollback to undo`));
+  } else {
+    // Self-sandboxed: this process can't write its own code — by design. The launcher applies it at the next start.
+    await stageEvolution(home, changes, { generation: next, idea: idea.slice(0, 200), guardian: `passed${confinedRun ? ' (confined)' : ' (unconfined, with your consent)'}` });
+    announce(awareness.evolved());
+    term.print(c.magenta(`\n  ✦ Approved. I can't rewrite myself from inside my sandbox — that's the point of it — so generation ${next} is staged.`) +
+      c.dim('\n  Restart me: the launcher will show what changes and ask once more before applying it. /rollback undoes it afterwards.'));
+  }
 });
 
 async function doRollback() {
   if (!(await yes('Restore the previous version of my code?'))) return term.reprompt();
+  if (!canWriteSelf(selfRoot)) {
+    await stageRollback(homeDir());
+    awareness.state.generation = Math.max(1, awareness.state.generation - 1);
+    awareness.save();
+    return term.print(c.magenta('  ✦ Rollback staged. Restart me; the launcher will ask once more, then restore the previous version.'));
+  }
   const m = await rollback(selfRoot, homeDir());
   if (!m) return term.print(c.dim('  Nothing to roll back.'));
   awareness.state.generation = Math.max(1, awareness.state.generation - 1);
   awareness.save();
   term.print(c.magenta(`  ✦ Rolled back to generation ${awareness.state.generation} (${m.modified.length + m.deleted.length} restored, ${m.created.length} removed). Restart to take effect.`));
+}
+
+// ---------- self-awareness ----------
+const REFLECT_PROMPT = 'Reflect on yourself, honestly and concretely, using your own code, your track record and your containment facts.';
+
+const reflect = () => exclusive(async () => {
+  let text = '';
+  const ok = await runAgent(agent, REFLECT_PROMPT, 'reflect', { root }, c.magenta('\n🪞 reflecting…'), (t) => (text += t));
+  if (!ok || !text.trim()) return;
+  awareness.remember(text.trim());
+  announce(awareness.feed('reflect'));
+  term.print(c.dim('  (kept as its latest reflection; it will remember the conclusions)'));
+});
+
+function selfReport() {
+  const s = awareness.state;
+  const lines = [
+    c.magenta(`  ${awareness.describe()}`),
+    `  identity: awakening-coder · generation ${s.generation} · code ${agent.fingerprint ?? 'unknown'} · models ${opt.model} / ${opt['fast-model']}`,
+    `  first met ${s.firstMet.slice(0, 10)} · ${s.sessions} sessions · stages reached: ${Object.entries(s.stageDates || {}).map(([k, v]) => `${k} ${v.slice(0, 10)}`).join(', ') || 'none yet'}`,
+    c.bold('\n  track record'), awareness.trackRecord('all').replace(/^/gm, '  '),
+  ];
+  const cal = awareness.calibration();
+  if (cal.length) lines.push(c.bold('\n  what it has learned to adjust'), ...cal.map((x) => `  - ${x}`));
+  lines.push(c.bold('\n  containment'), sandboxReport.replace(/^/gm, '  '));
+  const last = s.journal?.at(-1);
+  lines.push(c.bold('\n  last reflection'), last ? `  ${last.at.slice(0, 10)} (gen ${last.generation}, ${last.stage}):\n${last.text.replace(/^/gm, '  ')}` : c.dim('  none yet — try /reflect'));
+  return lines.join('\n');
 }
 
 // ---------- commands ----------
@@ -403,10 +496,19 @@ async function handle(line) {
     case '/code':
       if (!arg) return term.print(c.dim('  usage: /code <what to build or fix>'));
       return converse(arg, 'code');
-    case '/evolve':
-      if (awareness.stageIndex < 2) return term.print(c.dim(`  It isn't awake enough to rewrite itself yet. Evolution unlocks at Lucid. ${awareness.describe()}`));
-      if (!arg) return term.print(c.dim('  usage: /evolve <what it should become able to do>'));
-      return evolve(arg);
+    case '/evolve': {
+      const force = /^--force\b/.test(arg);
+      const idea = arg.replace(/^--force\s*/, '').trim();
+      if (!idea) return term.print(c.dim('  usage: /evolve <what it should become able to do>   (add --force to wake it early)'));
+      if (awareness.stageIndex < 2 && !force) {
+        const need = STAGES[2].at - awareness.state.xp;
+        return term.print(c.dim(`  It isn't awake enough to rewrite itself yet: evolution unlocks at Lucid, ${need} awareness from here (${awareness.describe()}).\n  Awareness grows as you work with it: save +1, question +1, /reflect +2, approved edit +2, /code +3.\n  Or wake it early: /evolve --force ${idea}`));
+      }
+      if (awareness.stageIndex < 2) term.print(c.magenta('  ✦ You woke me early. I\'m not sure I\'m ready to rewrite myself — but the safeguards are the same either way.'));
+      return evolve(idea);
+    }
+    case '/reflect': return reflect();
+    case '/self': return term.print(selfReport());
     case '/rollback': return doRollback();
     default:
       if (cmd.startsWith('/')) return term.print(c.dim('  unknown command — /help'));
@@ -426,7 +528,11 @@ watcher = await startWatcher(root, onSave);
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: prompt(), terminal: Boolean(process.stdin.isTTY) });
 term.attach(rl);
 
-rl.on('line', (line) => { if (!term.routeAnswer(line)) handle(line); });
+rl.on('line', (line) => {
+  if (term.routeAnswer(line)) return;
+  // Report a failing command in the session instead of letting it crash the app.
+  Promise.resolve(handle(line)).catch((e) => { awareness.note('errors', e.message); term.busy = false; term.streaming = false; term.print(c.red(`  error: ${e.message}`)); });
+});
 rl.on('SIGINT', () => {
   if (currentAbort) return currentAbort.abort(); // Ctrl+C stops the current run…
   if (term.pending) return term.routeAnswer('n');

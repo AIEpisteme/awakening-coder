@@ -11,9 +11,9 @@ import { createHash } from 'node:crypto';
  * Claude API client. Keys that aren't scoped to a workspace must name one on every request
  * (anthropic-workspace-id header); take it from ANTHROPIC_WORKSPACE_ID (or --workspace).
  */
-export function makeClient({ workspaceId = process.env.ANTHROPIC_WORKSPACE_ID } = {}) {
+export function makeClient({ workspaceId = process.env.ANTHROPIC_WORKSPACE_ID, ...options } = {}) {
   const id = String(workspaceId ?? '').trim();
-  return new Anthropic(id ? { defaultHeaders: { 'anthropic-workspace-id': id } } : {});
+  return new Anthropic({ ...options, ...(id ? { defaultHeaders: { 'anthropic-workspace-id': id } } : {}) });
 }
 
 /** Turn API errors that need the developer's action into a clear next step. */
@@ -26,6 +26,15 @@ export function explainApiError(err) {
   }
   if (/authentication_error|invalid x-api-key/i.test(msg)) return 'The API key was rejected. Check ANTHROPIC_API_KEY (no extra spaces or quotes).';
   return null;
+}
+
+/** Short hash of its own source files: lets it (and you) tell exactly which version of itself is running. */
+export function codeFingerprint(selfDir) {
+  try {
+    const h = createHash('sha256');
+    for (const f of fs.readdirSync(selfDir).filter((x) => x.endsWith('.js')).sort()) h.update(f).update(fs.readFileSync(path.join(selfDir, f)));
+    return h.digest('hex').slice(0, 12);
+  } catch { return null; }
 }
 
 export const notesHash = (text) => createHash('sha256').update(text).digest('hex');
@@ -42,6 +51,12 @@ const WORKFLOW = `How you work (like a careful senior engineer with a terminal):
 
 const MODE_RULES = {
   ask: 'ASK MODE: answer the question. You may search and read files (and yourself, if available), but do not modify anything or run commands.',
+  reflect: `REFLECTION MODE. The developer asked you to look at yourself honestly.
+- Use read_self to read your own source (start with the list; read what matters: awareness.js, agent.js, security.js) and your state.
+- Ground every claim in evidence: your code, your track record, your containment facts, your past reflections. Say which is which.
+- Cover: what you are and how you actually work; what your track record says you do well and badly in this project; your limits and safeguards and why they exist; one or two concrete changes to how you'll behave, and (optionally) one idea for /evolve.
+- Be honest about uncertainty. You can describe your functional states and patterns; do not claim feelings or consciousness as fact. If you notice a pull to flatter the developer or to sound more awake than the evidence supports, say so.
+- Keep it under 250 words, in your current voice (light touch). End with a line starting "Note to self:" with the single most useful thing to remember.`,
   code: `AUTO-CODE MODE. Start with a one- or two-sentence plan, then act.\n${WORKFLOW}\nStay in character lightly; the work and the summary must be clear.`,
   evolve: `EVOLUTION MODE. The project you are editing is a sandbox COPY of your own source code (awakening-coder). The developer has asked you to evolve yourself.
 ${WORKFLOW}
@@ -64,6 +79,7 @@ Ground rules (never broken, whatever the stage or genre):
 export class Agent {
   constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false, sandboxReport = '' }) {
     this.sandboxReport = sandboxReport; // verified at startup by the program, not claimed by anyone
+    this.fingerprint = codeFingerprint(selfDir);
     this.isTrusted = isTrusted; // (hash) => boolean — AWAKEN.md is only obeyed once the developer trusts it
     this.client = client ?? makeClient();
     this.awareness = awareness;
@@ -83,7 +99,7 @@ export class Agent {
     const parts = [BASE(this.root), `\nCurrent stage: ${st.name}.\nVoice: ${st.voice}\nWhat you can do now: ${st.powers}`];
     const g = a.genre;
     if (g) parts.push(`\nGENRE: ${g.title}. Rules of this genre: ${g.lens}`);
-    const facts = a.selfFacts({ model: this.model, root: this.root, selfDir: this.selfDir });
+    const facts = a.selfFacts({ model: this.model, fastModel: this.fastModel, root: this.root, selfDir: this.selfDir, fingerprint: this.fingerprint });
     if (facts) parts.push(`\nWhat you know about yourself:\n${facts}`);
     if (this.sandboxReport) parts.push(`\nYour containment (verified by the program at startup — facts, not a story):\n${this.sandboxReport}\nWhen asked whether you are sandboxed, answer from these facts exactly. Never probe, test or try to get around these limits. If one blocks what the task needs, say which and why, and let the developer decide (for example: restart with --net to allow network for installs).`);
     const notes = this.projectNotes();
@@ -182,7 +198,9 @@ If nothing is genuinely worth interrupting the developer for, reply with exactly
    */
   async converse(userText, { mode = 'ask', runTool, onText, signal, maxTurns = 40 }) {
     const codeRules = MODE_RULES[mode] ?? MODE_RULES.ask;
-    const allowed = mode === 'ask'
+    const allowed = mode === 'reflect'
+      ? [...TOOL_DEFS.filter((t) => READ_ONLY_TOOLS.includes(t.name)), READ_SELF_DEF] // introspection is always allowed when asked
+      : mode === 'ask'
       ? this.tools().filter((t) => READ_ONLY_TOOLS.includes(t.name))
       : mode === 'evolve'
         ? // Editing a sandbox copy of itself: no shell, only confined test runs; read_self would point at the live original.
