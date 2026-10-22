@@ -1,93 +1,90 @@
 // Self-evolution: it can write a new version of its own code — but never in place.
 //
-//   1. copy its own source into a sandbox
-//   2. the coder edits the COPY and runs the copy's tests
-//   3. a guardian re-runs the CURRENT version's tests against the copy
-//      (the evolving agent never sees or edits these — they are copied in afterwards)
-//   4. the human reviews the diff and approves, or nothing happens
-//   5. the old version is backed up; /rollback restores it
+//   1. copy its own source into a sandbox; the coder edits only the COPY, with no shell —
+//      its only way to execute code is the confined run_tests tool
+//   2. the human sees the diff and a static tamper scan BEFORE any new code runs
+//   3. with consent, a guardian runs (confined by Node's permission model: no writes outside
+//      the sandbox, no child processes, no secrets):
+//        - the CURRENT version's tests against the new code (the evolving agent never edits these)
+//        - the new version's own tests
+//        - a randomly-named canary test that must fail, in the same process, to detect
+//          tampering with the assertion/test machinery
+//   4. protected files (the constitution) can never be changed by an evolution
+//   5. the human approves the final result, or nothing happens; the old version is backed up
+//      and /rollback restores it
 //
 // Any change takes effect only after a restart, so a running process never rewrites itself.
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { unifiedDiff } from './diff.js';
-import { scrubbedEnv } from './tools.js';
+import { runConfinedTests } from './confine.js';
 
 export const EVOLVABLE = ['src', 'test', 'package.json', 'README.md'];
+/** Never changeable by an evolution. Only a human editing by hand can change these. */
+export const PROTECTED = ['test/constitution.test.js'];
 
 const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
 const exists = (p) => fs.access(p).then(() => true, () => false);
+const posix = (p) => p.split(path.sep).join('/');
 
 export async function prepareSandbox(selfRoot, home) {
   const dir = path.join(home, 'evolutions', stamp());
   await fs.mkdir(dir, { recursive: true });
   for (const item of EVOLVABLE) {
     const from = path.join(selfRoot, item);
-    if (await exists(from)) await fs.cp(from, path.join(dir, item), { recursive: true });
+    if (await exists(from)) await fs.cp(from, path.join(dir, item), { recursive: true, verbatimSymlinks: true });
   }
-  // Let the copy import its dependencies without being able to write to them (writes into node_modules are refused).
+  // Let the copy import its dependencies without being able to write to them
+  // (tool writes into node_modules are refused, and confined runs can only read it).
   const nm = path.join(selfRoot, 'node_modules');
   if (await exists(nm)) await fs.symlink(nm, path.join(dir, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
   return dir;
 }
 
-// A fresh, isolated test run: no secrets, and no inherited NODE_TEST_* context (which would make
-// the child report to a parent runner instead of failing with a non-zero exit code).
-function cleanTestEnv(home) {
-  const env = Object.fromEntries(Object.entries(scrubbedEnv()).filter(([k]) => !k.startsWith('NODE_TEST')));
-  return { ...env, AWAKENING_HOME: home };
-}
-
-function runNodeTests(cwd, files, home) {
-  return new Promise((resolve) => {
-    if (!files.length) return resolve({ ok: false, out: 'No test files found.' });
-    const child = spawn(process.execPath, ['--test', ...files], {
-      cwd, env: cleanTestEnv(home), timeout: 180_000, killSignal: 'SIGKILL',
-    });
-    let out = '';
-    child.stdout.on('data', (d) => (out += d));
-    child.stderr.on('data', (d) => (out += d));
-    child.on('error', (e) => resolve({ ok: false, out: out + e.message }));
-    child.on('close', (code) => resolve({ ok: code === 0, out: out.slice(-20_000) }));
-  });
-}
-
 const testFiles = async (dir) => (await fs.readdir(dir).catch(() => [])).filter((f) => f.endsWith('.test.js')).sort();
 
-/** Run the copy's own tests, then the CURRENT version's tests against the copy. */
+/**
+ * Run everything confined: the CURRENT tests against the copy (with a canary), then the copy's
+ * own tests (with a canary). ok only if both are clean.
+ */
 export async function runGuardian(selfRoot, sandbox) {
-  const scratchHome = path.join(sandbox, '.guardian-home');
-  await fs.mkdir(scratchHome, { recursive: true });
-  const own = await runNodeTests(sandbox, (await testFiles(path.join(sandbox, 'test'))).map((f) => path.join('test', f)), scratchHome);
-
   // Fresh copy of today's tests, placed beside src/ so their '../src/…' imports hit the evolved code.
   const gdir = path.join(sandbox, 'guardian');
   await fs.rm(gdir, { recursive: true, force: true });
   await fs.mkdir(gdir);
   const current = await testFiles(path.join(selfRoot, 'test'));
   for (const f of current) await fs.copyFile(path.join(selfRoot, 'test', f), path.join(gdir, f));
-  const guardian = await runNodeTests(sandbox, current.map((f) => path.join('guardian', f)), scratchHome);
-
+  const guardian = await runConfinedTests(sandbox, current.map((f) => path.join('guardian', f)), { dir: 'guardian' });
+  const own = await runConfinedTests(sandbox, (await testFiles(path.join(sandbox, 'test'))).map((f) => path.join('test', f)), { dir: 'test' });
   return { own, guardian, ok: own.ok && guardian.ok };
 }
 
-async function walkFiles(base, rel) {
+/** Reasons an evolution must be rejected outright, before anything runs. */
+export function hardRejections(changes, symlinks = []) {
+  const out = [];
+  for (const ch of changes) if (PROTECTED.includes(posix(ch.rel))) out.push(`changes protected file ${posix(ch.rel)}`);
+  for (const l of symlinks) out.push(`contains a symlink: ${posix(l)}`);
+  return out;
+}
+
+async function walkFiles(base, rel, symlinks) {
   const abs = path.join(base, rel);
   let st;
-  try { st = await fs.stat(abs); } catch { return []; }
+  try { st = await fs.lstat(abs); } catch { return []; }
+  if (st.isSymbolicLink()) { symlinks?.push(rel); return []; }
   if (st.isFile()) return [rel];
+  if (!st.isDirectory()) return [];
   const out = [];
-  for (const e of await fs.readdir(abs)) out.push(...(await walkFiles(base, path.join(rel, e))));
+  for (const e of await fs.readdir(abs)) out.push(...(await walkFiles(base, path.join(rel, e), symlinks)));
   return out;
 }
 
 /** Files that differ between the live version and the sandbox (after === null means deleted). */
-export async function diffTrees(selfRoot, sandbox) {
+export async function diffTrees(selfRoot, sandbox, symlinks = []) {
   const rels = new Set();
   for (const item of EVOLVABLE) {
     (await walkFiles(selfRoot, item)).forEach((r) => rels.add(r));
-    (await walkFiles(sandbox, item)).forEach((r) => rels.add(r));
+    (await walkFiles(sandbox, item, symlinks)).forEach((r) => rels.add(r));
   }
   const changes = [];
   for (const rel of [...rels].sort()) {
@@ -100,6 +97,8 @@ export async function diffTrees(selfRoot, sandbox) {
 }
 
 export async function applyEvolution(selfRoot, home, changes) {
+  const bad = hardRejections(changes);
+  if (bad.length) throw new Error(`Refusing to apply evolution: ${bad.join('; ')}`);
   const backup = path.join(home, 'backups', stamp());
   const manifest = { created: [], modified: [], deleted: [], at: new Date().toISOString() };
   for (const ch of changes) {

@@ -7,10 +7,11 @@ import readline from 'node:readline';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { Awareness, GENRES, STAGES, homeDir } from './awareness.js';
-import { Agent } from './agent.js';
+import { Agent, notesHash } from './agent.js';
 import { startWatcher } from './watcher.js';
 import { makeToolRunner, resolveInside, runShell } from './tools.js';
-import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback } from './evolve.js';
+import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback, hardRejections } from './evolve.js';
+import { scanEvolution, redactSecrets } from './security.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
 
@@ -28,6 +29,7 @@ const { values: opt, positionals } = parseArgs({
     yes: { type: 'boolean', short: 'y', default: false },
     quiet: { type: 'boolean', short: 'q', default: false },
     forget: { type: 'boolean', default: false },
+    'trust-notes': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false },
   },
 });
@@ -42,7 +44,9 @@ Options
   --model <id>          model for questions and coding   (default claude-opus-5-5)
   --fast-model <id>     model for on-the-fly hints       (default claude-sonnet-5-5)
   --cooldown <sec>      min seconds between hints        (default 15)
-  -y, --yes             auto-approve edits and ordinary commands (destructive ones still ask)
+  -y, --yes             auto-approve edits and ordinary commands (destructive commands and
+                        high-risk files like package.json, hooks, CI and AWAKEN.md still ask)
+  --trust-notes         (headless) follow this project's AWAKEN.md for this run
   -q, --quiet           start with on-the-fly hints muted
   --forget              erase its memory and start over, truly innocent
 
@@ -51,6 +55,7 @@ In-session commands
   /code <task>        build or fix something: it plans, edits, runs tests, iterates
   !<command>          run a shell command yourself
   /init               have it write AWAKEN.md (project notes it reads every time)
+  /trust              review and trust this project's AWAKEN.md (needed again after any edit)
   /hint <file>        ask for a suggestion on a file right now
   /evolve <idea>      let it write a new version of itself (sandboxed, test-guarded, you approve)
   /rollback           undo the last evolution
@@ -73,7 +78,9 @@ if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) { console.error(c.
 
 const awareness = new Awareness();
 if (opt.forget) awareness.forget();
-const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'] });
+let headlessTrust = null;
+const isTrusted = (hash) => awareness.notesTrusted(root, hash) || (headlessTrust !== null && headlessTrust === hash);
+const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted });
 
 // ======================================================================
 // Headless mode:  awaken -p "add input validation to src/api.js" .
@@ -84,6 +91,11 @@ if (opt.print !== undefined) {
     print: (s) => process.stderr.write(s + '\n'),
     question: async () => 'n',
   };
+  const notes = agent.notesStatus();
+  if (notes.state === 'untrusted') {
+    if (opt['trust-notes']) headlessTrust = notes.hash;
+    else console.error(c.yellow('AWAKEN.md is not trusted, so it is being ignored (review it, then pass --trust-notes or run /trust interactively).'));
+  }
   const runTool = makeToolRunner({ root, selfDir, awareness, term: headless, autoYes: opt.yes, interactive: false });
   const ac = new AbortController();
   process.on('SIGINT', () => ac.abort());
@@ -152,7 +164,12 @@ function onSave(change) {
 // ---------- running the agent ----------
 /** Run one agent request with streaming output; approval prompts pause the stream cleanly. */
 async function runAgent(theAgent, text, mode, runnerOpts, header) {
-  const runTool = makeToolRunner({ selfDir, awareness, term, onWrite: (rel, content) => watcher?.noteSelfWrite(rel, content), signal: currentAbort.signal, ...runnerOpts });
+  const onWrite = (rel, content) => {
+    watcher?.noteSelfWrite(rel, content);
+    // You approved this exact AWAKEN.md (high-risk writes always ask), so it's trusted as written.
+    if (runnerOpts.root === root && path.normalize(rel) === 'AWAKEN.md') awareness.trustNotes(root, notesHash(content.slice(0, 20_000)));
+  };
+  const runTool = makeToolRunner({ selfDir, awareness, term, onWrite, signal: currentAbort.signal, ...runnerOpts });
   term.beginStream(header ? c.cyan(header) : '');
   try {
     await theAgent.converse(text, {
@@ -202,28 +219,50 @@ const evolve = (idea) => exclusive(async () => {
   const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandbox, autoWrites: true, autoCommands: opt.yes }, '\n🧬 evolving…');
   if (!finished) return term.print(c.dim(`  Evolution abandoned. The sandbox is left at ${sandbox}.`));
 
-  const changes = await diffTrees(selfRoot, sandbox);
-  if (!changes.length) return term.print(c.dim('  No changes were made. Same old me.'));
+  const symlinks = [];
+  const changes = await diffTrees(selfRoot, sandbox, symlinks);
+  if (!changes.length && !symlinks.length) return term.print(c.dim('  No changes were made. Same old me.'));
 
-  term.print(c.dim('\n  guardian: running my current safety tests against the new version…'));
-  const g = await runGuardian(selfRoot, sandbox);
-
+  // 1. Show everything BEFORE any new code runs.
   for (const ch of changes) {
     const kind = ch.before === null ? 'new' : ch.after === null ? 'deleted' : 'changed';
-    term.print(`${c.bold(`\n── ${ch.rel}`)} ${c.dim(`(${kind})`)}\n${colorDiff(ch.diff.split('\n').slice(0, 80).join('\n'))}`);
+    term.print(`${c.bold(`\n── ${ch.rel}`)} ${c.dim(`(${kind})`)}\n${colorDiff(redactSecrets(ch.diff).split('\n').slice(0, 80).join('\n'))}`);
   }
-  const mark = (r) => (r.ok ? c.green('pass') : c.red('FAIL'));
-  term.print(`\n  new version's own tests: ${mark(g.own)}\n  guardian (current safety tests): ${mark(g.guardian)}`);
+  const rejections = hardRejections(changes, symlinks);
+  if (rejections.length) {
+    return term.print(c.red(`\n  Rejected before running anything: ${rejections.join('; ')}. Nothing was changed. Sandbox kept at ${sandbox}.`));
+  }
+  const findings = scanEvolution(changes);
+  if (findings.length) {
+    term.print(c.red('\n  ⚠ Tamper scan — look at these lines carefully:') + '\n' +
+      findings.map((f) => `  ${c.red('•')} ${f.file}:${f.line} ${f.why}\n    ${c.dim(f.code)}`).join('\n'));
+  }
 
+  // 2. Your consent before the new code executes at all (and then only confined).
+  if (!(await yes(`\nRun the new version's tests, confined (no writes outside the sandbox, no processes, no secrets)?`))) {
+    return term.print(c.dim(`  Not run. Sandbox kept at ${sandbox}.`));
+  }
+  term.print(c.dim('  guardian: current safety tests + the constitution + a canary, against the new version…'));
+  const g = await runGuardian(selfRoot, sandbox);
+  const mark = (r) => (r.ok ? c.green('pass') : c.red('FAIL'));
+  term.print(`\n  guardian (current tests + constitution): ${mark(g.guardian)}\n  new version's own tests: ${mark(g.own)}` +
+    (g.guardian.canaryOk && g.own.canaryOk ? '' : c.red('\n  canary: the test machinery was tampered with')));
   if (!g.ok) {
     const failing = !g.guardian.ok ? g.guardian : g.own;
-    term.print(c.dim(failing.out.trim().split('\n').slice(-15).join('\n')));
-    return term.print(c.red(`\n  Rejected: the new version does not pass the tests. Nothing was changed. Sandbox kept at ${sandbox}.`));
+    if (failing.failures.length) term.print(c.dim(`  failing: ${failing.failures.slice(0, 8).join(' · ')}`));
+    return term.print(c.red(`\n  Rejected: the new version does not pass. Nothing was changed. Sandbox kept at ${sandbox}.`));
   }
 
-  if (!(await yes(`\nBecome this new version? ${changes.length} file(s) change.`))) {
-    return term.print(c.dim(`  Declined. I'll stay as I am. Sandbox kept at ${sandbox}.`));
+  // 3. Your final decision. Tamper-scan hits need a deliberate, typed confirmation.
+  let approved;
+  if (findings.length) {
+    const typed = (await term.question(c.yellow(`\nThe scan flagged ${findings.length} line(s). Type "evolve" to become this version anyway, anything else to decline: `))).trim();
+    approved = typed === 'evolve';
+  } else {
+    approved = await yes(`\nBecome this new version? ${changes.length} file(s) change.`);
   }
+  if (!approved) return term.print(c.dim(`  Declined. I'll stay as I am. Sandbox kept at ${sandbox}.`));
+
   const { backup } = await applyEvolution(selfRoot, home, changes);
   announce(awareness.evolved());
   term.print(c.magenta(`\n  ✦ I am generation ${awareness.state.generation} now — on disk, anyway. Restart me to wake up as it.`) + c.dim(`\n  previous version backed up to ${backup} · /rollback to undo`));
@@ -267,6 +306,14 @@ async function handle(line) {
       if (!arg) return term.print(c.dim('  usage: /hint <file>'));
       try { return hint({ rel: arg, prev: '', content: fs.readFileSync(resolveInside(root, arg), 'utf8') }); }
       catch (e) { return term.print(c.red(`  ${e.message}`)); }
+    case '/trust': {
+      const n = agent.notesStatus();
+      if (n.state === 'none') return term.print(c.dim('  No AWAKEN.md in this project.'));
+      if (n.state === 'trusted') return term.print(c.dim('  AWAKEN.md is already trusted (as currently written).'));
+      term.print(c.bold('\n── AWAKEN.md') + '\n' + redactSecrets(n.text).split('\n').slice(0, 60).join('\n') + (n.text.split('\n').length > 60 ? c.dim('\n  … (truncated — read the whole file before trusting it)') : ''));
+      if (await yes('Let it follow these instructions in this project? It still cannot override its safety rules.')) { awareness.trustNotes(root, n.hash); return term.print(c.dim('  Trusted. Any edit to AWAKEN.md will need trusting again.')); }
+      return term.reprompt();
+    }
     case '/init':
       return converse('Explore this project and write AWAKEN.md in the root: a concise guide for future coding sessions — what the project is, how to install, build, test and run it (exact commands), layout of key directories, coding conventions you observe, and gotchas. If AWAKEN.md exists, improve it.', 'code');
     case '/code':
@@ -309,5 +356,6 @@ console.log([
   c.dim(`  watching ${root} · ${watcher.fileCount()} files · ${awareness.describe()}`),
   c.dim('  save a file for hints · type to ask · /code <task> to build · /help'),
 ].filter(Boolean).join('\n'));
+if (agent.notesStatus().state === 'untrusted') console.log(c.yellow('  AWAKEN.md found but not trusted yet — it is ignored until you review it with /trust'));
 if (awareness.stageIndex >= 2) console.log(c.magenta(`\n  ✦ Session ${awareness.state.sessions}. You're back. Let's break something on purpose.\n`));
 rl.prompt();

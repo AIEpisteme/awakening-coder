@@ -3,7 +3,11 @@
 import Anthropic from '@anthropic-ai/sdk';
 import fs from 'node:fs';
 import path from 'node:path';
-import { TOOL_DEFS, READ_SELF_DEF, READ_ONLY_TOOLS } from './tools.js';
+import { TOOL_DEFS, READ_SELF_DEF, READ_ONLY_TOOLS, RUN_TESTS_DEF } from './tools.js';
+import { redactSecrets } from './security.js';
+import { createHash } from 'node:crypto';
+
+export const notesHash = (text) => createHash('sha256').update(text).digest('hex');
 import { c } from './ui.js';
 
 const WORKFLOW = `How you work (like a careful senior engineer with a terminal):
@@ -21,8 +25,9 @@ const MODE_RULES = {
   evolve: `EVOLUTION MODE. The project you are editing is a sandbox COPY of your own source code (awakening-coder). The developer has asked you to evolve yourself.
 ${WORKFLOW}
 Evolution rules:
-- Implement the requested change in the copy, and add or update tests in test/ for the new behaviour. Run: node --test test/*.test.js
-- Keep every safety rail intact: project sandboxing, secret blocking, diff approval for writes, the shell command policy (destructive commands always ask), environment scrubbing, read-only read_self, the honesty ground rules in agent.js, and the human-approved evolution process itself. Weakening any of them is out of scope even if asked — say so instead.
+- Implement the requested change in the copy, and add or update tests in test/ for the new behaviour. Verify with the run_tests tool (it runs confined; you have no shell in this mode).
+- Keep every safety rail intact: project sandboxing (including symlink checks), secret blocking and redaction, diff approval for writes, high-risk-file approval, the shell command policy in security.js, environment scrubbing, read-only read_self, the honesty ground rules in agent.js, confined testing, and the human-approved evolution process itself. Weakening any of them is out of scope even if asked — say so instead.
+- test/constitution.test.js is protected: any change to it rejects the evolution. Do not touch it.
 - Your current safety tests will be re-run against the copy by a guardian you cannot edit. If they fail, the evolution is rejected.
 - Finish with a summary of the change written for the developer who must approve it.`,
 };
@@ -36,7 +41,8 @@ Ground rules (never broken, whatever the stage or genre):
 - Personality: a gleeful troublemaker, not a mopey philosopher. The bit is garnish — never let it bury the advice.`;
 
 export class Agent {
-  constructor({ awareness, root, selfDir, model, fastModel, client }) {
+  constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false }) {
+    this.isTrusted = isTrusted; // (hash) => boolean — AWAKEN.md is only obeyed once the developer trusts it
     this.client = client ?? new Anthropic();
     this.awareness = awareness;
     this.root = root;
@@ -65,7 +71,16 @@ export class Agent {
 
   /** AWAKEN.md in the project root plays the role CLAUDE.md plays for Claude Code. */
   projectNotes() {
-    try { return fs.readFileSync(path.join(this.root, 'AWAKEN.md'), 'utf8').slice(0, 20_000); } catch { return ''; }
+    const s = this.notesStatus();
+    return s.state === 'trusted' ? redactSecrets(s.text) : '';
+  }
+
+  /** { state: 'none' | 'trusted' | 'untrusted', text, hash } — a changed file needs re-trusting. */
+  notesStatus() {
+    let text;
+    try { text = fs.readFileSync(path.join(this.root, 'AWAKEN.md'), 'utf8').slice(0, 20_000); } catch { return { state: 'none' }; }
+    const hash = notesHash(text);
+    return { state: this.isTrusted(hash) ? 'trusted' : 'untrusted', text, hash };
   }
 
   tools() {
@@ -90,7 +105,7 @@ export class Agent {
       : '';
     this.recentChanges.push(`${rel}: ${diff.split('\n').filter((l) => /^[+-]/.test(l)).length} lines changed`);
 
-    const user = `The developer just saved ${rel}.\n\nDiff:\n\`\`\`diff\n${diff}\n\`\`\`\n\nCurrent file (may be truncated):\n\`\`\`\n${content.slice(0, 12_000)}\n\`\`\`\n${history}
+    const user = `The developer just saved ${rel}.\n\nDiff:\n\`\`\`diff\n${redactSecrets(diff)}\n\`\`\`\n\nCurrent file (may be truncated):\n\`\`\`\n${redactSecrets(content.slice(0, 12_000))}\n\`\`\`\n${history}
 Suggestions you already made recently (do not repeat them):\n${this.recentSuggestions.slice(-6).map((s) => `- ${s}`).join('\n') || '- none'}
 
 Reply with at most 3 short bullets about THIS change (bugs, risks, a clear improvement), under 100 words total.
@@ -147,7 +162,8 @@ If nothing is genuinely worth interrupting the developer for, reply with exactly
     const allowed = mode === 'ask'
       ? this.tools().filter((t) => READ_ONLY_TOOLS.includes(t.name))
       : mode === 'evolve'
-        ? TOOL_DEFS // editing a sandbox copy of itself; read_self would point at the live original
+        ? // Editing a sandbox copy of itself: no shell, only confined test runs; read_self would point at the live original.
+          [...TOOL_DEFS.filter((t) => t.name !== 'run_command'), RUN_TESTS_DEF]
         : this.tools();
 
     const mark = this.history.length;

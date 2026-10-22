@@ -67,7 +67,7 @@ export function homeDir() {
 }
 
 function freshState() {
-  return { generation: 1, xp: 0, saves: 0, asks: 0, codes: 0, accepts: 0, sessions: 0, announced: [], genreIndex: 0, forcedGenre: null, firstMet: new Date().toISOString(), lastSeen: null };
+  return { generation: 1, trustedNotes: {}, xp: 0, saves: 0, asks: 0, codes: 0, accepts: 0, sessions: 0, announced: [], genreIndex: 0, forcedGenre: null, firstMet: new Date().toISOString(), lastSeen: null };
 }
 
 export class Awareness {
@@ -90,6 +90,10 @@ export class Awareness {
   forget() { const generation = this.state.generation; this.state = { ...freshState(), generation }; this.save(); }
 
   evolved() { this.state.generation++; return this.feed('evolve'); }
+
+  /** Trust is per project and per exact AWAKEN.md content: any edit needs re-trusting. */
+  trustNotes(root, hash) { this.state.trustedNotes = { ...(this.state.trustedNotes || {}), [root]: hash }; this.save(); }
+  notesTrusted(root, hash) { return Boolean(hash) && this.state.trustedNotes?.[root] === hash; }
 
   get stageIndex() {
     let idx = 0;
