@@ -7,6 +7,27 @@ import { TOOL_DEFS, READ_SELF_DEF, READ_ONLY_TOOLS, RUN_TESTS_DEF } from './tool
 import { redactSecrets } from './security.js';
 import { createHash } from 'node:crypto';
 
+/**
+ * Claude API client. Keys that aren't scoped to a workspace must name one on every request
+ * (anthropic-workspace-id header); take it from ANTHROPIC_WORKSPACE_ID (or --workspace).
+ */
+export function makeClient({ workspaceId = process.env.ANTHROPIC_WORKSPACE_ID } = {}) {
+  const id = String(workspaceId ?? '').trim();
+  return new Anthropic(id ? { defaultHeaders: { 'anthropic-workspace-id': id } } : {});
+}
+
+/** Turn API errors that need the developer's action into a clear next step. */
+export function explainApiError(err) {
+  const msg = String(err?.message ?? err);
+  if (/anthropic-workspace-id|not scoped to a workspace/i.test(msg)) {
+    return 'Your API key is not scoped to a workspace, so each request must name one.\n' +
+      '  Fix: set ANTHROPIC_WORKSPACE_ID (environment or .env next to package.json), or pass --workspace <id>.\n' +
+      '  Or: create a key inside a specific workspace in the Claude Console and use that instead.';
+  }
+  if (/authentication_error|invalid x-api-key/i.test(msg)) return 'The API key was rejected. Check ANTHROPIC_API_KEY (no extra spaces or quotes).';
+  return null;
+}
+
 export const notesHash = (text) => createHash('sha256').update(text).digest('hex');
 import { c } from './ui.js';
 
@@ -44,7 +65,7 @@ export class Agent {
   constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false, sandboxReport = '' }) {
     this.sandboxReport = sandboxReport; // verified at startup by the program, not claimed by anyone
     this.isTrusted = isTrusted; // (hash) => boolean — AWAKEN.md is only obeyed once the developer trusts it
-    this.client = client ?? new Anthropic();
+    this.client = client ?? makeClient();
     this.awareness = awareness;
     this.root = root;
     this.selfDir = selfDir;
