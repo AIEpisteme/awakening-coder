@@ -2,22 +2,41 @@
 // introspect. Everything is sandboxed to one root, secrets are never read, writes are shown
 // as diffs and confirmed, and risky shell commands always ask — even with --yes.
 import fs from 'node:fs/promises';
+import fss from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { unifiedDiff } from './diff.js';
 import { colorDiff, c } from './ui.js';
+import { isSecretPath, redactSecrets, containsSecret, REDACTED, scrubbedEnv, classifyCommand, dangerReason, isHighRiskWrite } from './security.js';
+import { runConfinedTests } from './confine.js';
+
+export { isSecretPath, scrubbedEnv, classifyCommand };
 
 const SKIP_DIRS = new Set(['node_modules', '.git', '.awakening', 'dist', 'build', 'coverage', '.next', '.cache']);
-const SECRET = /(^|[\\/])(\.env(\..*)?|.*\.(pem|key|p12|pfx)|id_rsa.*|id_ed25519.*|\.npmrc|\.netrc|credentials(\.json)?)$/i;
 
-export const isSecretPath = (rel) => SECRET.test(rel);
-
-export function resolveInside(root, rel) {
-  const abs = path.resolve(root, rel);
+function checkRel(root, abs, rel) {
   const relBack = path.relative(root, abs);
   if (relBack.startsWith('..') || path.isAbsolute(relBack)) throw new Error(`Path escapes the project: ${rel}`);
   if (relBack.split(path.sep).some((p) => p === '.git')) throw new Error('Refusing to touch .git');
   if (isSecretPath(relBack)) throw new Error(`Refusing to read or write a secrets file: ${rel}`);
+  return relBack;
+}
+
+/**
+ * Resolve a path inside root. Checks the literal path AND where it really points after
+ * following symlinks (for a not-yet-existing file, its nearest existing parent), so a symlink
+ * inside the project can't lead to ~/.ssh or /etc.
+ */
+export function resolveInside(root, rel) {
+  const abs = path.resolve(root, String(rel ?? ''));
+  checkRel(root, abs, rel);
+  let realRoot;
+  try { realRoot = fss.realpathSync(root); } catch { return abs; }
+  let probe = abs, tail = [];
+  while (!fss.existsSync(probe) && probe !== path.dirname(probe)) { tail.unshift(path.basename(probe)); probe = path.dirname(probe); }
+  let real;
+  try { real = path.join(fss.realpathSync(probe), ...tail); } catch { real = abs; }
+  if (real !== abs || realRoot !== root) checkRel(realRoot, real, rel);
   return abs;
 }
 
@@ -61,24 +80,6 @@ export function globToRegExp(glob) {
 }
 const escapeRe = (s) => s.replace(/[.+^$()|[\]\\]/g, '\\$&');
 const posix = (p) => p.split(path.sep).join('/');
-
-// ---------- shell policy ----------
-const META = /[;&|`$<>]|\n/;
-const SAFE_CMD = /^(git (status|diff|log|show|branch)\b|ls\b|pwd$|node --version$|npm (test|run (test|lint|build|typecheck))\b|node --test\b|npx (tsc|eslint|vitest run|jest|prettier --check)\b|tsc\b)/;
-const DANGER_CMD = /(\brm\s+-[a-z]*[rf]|\bsudo\b|\b(curl|wget)\b[^|]*\|\s*(ba|z)?sh|\bgit\s+(push|reset\s+--hard|clean\s+-[a-z]*f)|\bchmod\s+-R|\bmkfs|\bdd\s+if=|>\s*\/dev\/|\bnpm\s+publish|\bssh\b|\bscp\b|\.env\b|id_rsa|\bshutdown\b|\breboot\b|:\(\)\s*\{)/i;
-
-/** 'auto' (safe, read-only-ish), 'ask' (normal), or 'danger' (always asks, even with --yes). */
-export function classifyCommand(cmd) {
-  const t = cmd.trim();
-  if (DANGER_CMD.test(t)) return 'danger';
-  if (SAFE_CMD.test(t) && !META.test(t)) return 'auto';
-  return 'ask';
-}
-
-const SECRET_ENV = /(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|CREDENTIAL)|^ANTHROPIC_/i;
-export function scrubbedEnv(env = process.env) {
-  return Object.fromEntries(Object.entries(env).filter(([k]) => !SECRET_ENV.test(k)));
-}
 
 export function runShell(cmd, { cwd, timeoutMs = 120_000, signal } = {}) {
   return new Promise((resolve) => {
@@ -169,6 +170,13 @@ export const TOOL_DEFS = [
   },
 ];
 
+export const RUN_TESTS_DEF = {
+  name: 'run_tests',
+  description:
+    'Run node --test on test files inside a confined sandbox (Node permission model: reads and writes only inside the project, no child processes, no secrets). Use this instead of a shell. Returns pass/fail and output.',
+  input_schema: { type: 'object', properties: { files: { type: 'array', items: { type: 'string' }, description: 'Test files relative to the project root; default: all test/*.test.js' } } },
+};
+
 export const READ_ONLY_TOOLS = ['list_files', 'glob', 'grep', 'read_file', 'read_self'];
 
 export const READ_SELF_DEF = {
@@ -191,12 +199,18 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
   }
 
   async function writeApproved(rel, abs, before, after) {
-    const diff = unifiedDiff(before, after) || '(no change)';
-    term.print(`${c.bold(`\n✎ ${before === '' ? 'create' : 'edit'} ${rel}`)}\n${colorDiff(diff)}`);
-    if (!autoWrites && !(await approve('Apply this change?'))) {
+    // The model only ever sees redacted secrets; never let it write a placeholder over a real one.
+    if (after.includes(REDACTED) && containsSecret(before)) {
+      return 'Refused: this would replace a real secret in the file with a [REDACTED] placeholder. Use edit_file on the specific lines you need to change, leaving the secret untouched.';
+    }
+    const risky = isHighRiskWrite(path.relative(root, abs));
+    const diff = redactSecrets(unifiedDiff(before, after)) || '(no change)';
+    term.print(`${c.bold(`\n✎ ${before === '' ? 'create' : 'edit'} ${rel}`)}${risky ? c.red('  ⚠ this file controls what runs or what I obey later') : ''}\n${colorDiff(diff)}`);
+    // High-risk files always need a human, even with --yes (and never apply non-interactively).
+    if ((risky || !autoWrites) && !(await approve(risky ? c.red('Apply this high-risk change?') : 'Apply this change?'))) {
       return interactive
         ? 'The developer declined this change. Ask what they would prefer, or try a different approach.'
-        : 'Change not applied: running non-interactively without --yes, so edits cannot be approved.';
+        : `Change not applied: running non-interactively${risky ? ' and this is a high-risk file that always needs a human' : ' without --yes'}.`;
     }
     await fs.mkdir(path.dirname(abs), { recursive: true });
     onWrite?.(rel, after); // so the watcher doesn't "suggest" on our own edit
@@ -230,7 +244,7 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
             text = await fs.readFile(path.join(root, f), 'utf8');
           } catch { continue; }
           if (text.includes('\u0000')) continue; // binary
-          text.split('\n').forEach((line, i) => { if (out.length < 200 && re.test(line)) out.push(`${f}:${i + 1}: ${line.slice(0, 240)}`); });
+          text.split('\n').forEach((line, i) => { if (out.length < 200 && re.test(line)) out.push(`${f}:${i + 1}: ${redactSecrets(line).slice(0, 240)}`); });
           if (out.length >= 200) break;
         }
         return out.join('\n') || '(no matches)';
@@ -240,7 +254,7 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
         const abs = resolveInside(root, input.path);
         const st = await fs.stat(abs);
         if (st.size > 200_000) return `File is ${st.size} bytes — too large to read whole. Use grep to find the part you need.`;
-        return await fs.readFile(abs, 'utf8');
+        return redactSecrets(await fs.readFile(abs, 'utf8'));
       }
 
       case 'write_file': {
@@ -253,6 +267,7 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
         const abs = resolveWritable(root, input.path);
         const before = await fs.readFile(abs, 'utf8');
         const count = before.split(input.old_str).length - 1;
+        if (count === 0 && String(input.old_str).includes(REDACTED)) return 'old_str contains a redacted secret, which never matches the real file. Choose old_str from lines that contain no secret.';
         if (count === 0) return 'old_str not found. Read the file again and copy the exact text (whitespace matters).';
         if (count > 1) return `old_str matches ${count} places; include more surrounding text so it is unique.`;
         const idx = before.indexOf(input.old_str);
@@ -264,14 +279,25 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
         const cmd = String(input.command || '').trim();
         if (!cmd) return 'Empty command.';
         const kind = classifyCommand(cmd);
-        term.print(`${kind === 'danger' ? c.red('\n⚠ $ ') : c.bold('\n$ ')}${cmd}`);
-        const ok = kind === 'auto' || (kind === 'ask' && autoCommands) || (await approve(kind === 'danger' ? c.red('This command looks destructive. Run it?') : 'Run this command?'));
+        const why = dangerReason(cmd);
+        term.print(`${kind === 'danger' ? c.red(`\n⚠ (${why}) $ `) : c.bold('\n$ ')}${cmd}`);
+        const ok = kind === 'auto' || (kind === 'ask' && autoCommands) || (await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : 'Run this command?'));
         if (!ok) return interactive ? 'The developer declined to run this command.' : 'Command not run: non-interactive mode cannot approve it (use --yes for ordinary commands; destructive ones are never auto-approved).';
         const timeoutMs = Math.min(600, Math.max(1, Number(input.timeout_seconds) || 120)) * 1000;
         const { code, signal: sig, out } = await runShell(cmd, { cwd: root, timeoutMs, signal });
-        const tail = out.trim().split('\n').slice(-6).join('\n');
+        const tail = redactSecrets(out).trim().split('\n').slice(-6).join('\n');
         term.print(c.dim(tail ? tail.replace(/^/gm, '  ') : '  (no output)') + (code === 0 ? '' : c.yellow(`\n  exit ${code ?? sig}`)));
-        return `exit code: ${code ?? `killed (${sig})`}\n${out || '(no output)'}`;
+        return `exit code: ${code ?? `killed (${sig})`}\n${redactSecrets(out) || '(no output)'}`;
+      }
+
+      case 'run_tests': {
+        const all = (await fs.readdir(path.join(root, 'test')).catch(() => [])).filter((f) => f.endsWith('.test.js')).map((f) => path.join('test', f));
+        const files = (Array.isArray(input.files) && input.files.length ? input.files : all).map((f) => path.relative(root, resolveInside(root, f)));
+        term.print(c.bold(`\n🧪 confined: node --test ${files.join(' ')}`));
+        const r = await runConfinedTests(root, files, { canary: false });
+        const summary = (r.out.match(/^# (pass|fail) \d+/gm) || []).join(', ');
+        term.print(c.dim(`  ${summary || 'no summary'}`));
+        return `${r.ok ? 'PASS' : 'FAIL'} (${summary})\n${redactSecrets(r.out)}`;
       }
 
       case 'todo_write': {
@@ -285,7 +311,9 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
         if (!selfDir) return 'Introspection unavailable here.';
         if (!input.file) return (await fs.readdir(selfDir)).filter((f) => f.endsWith('.js')).join('\n') + '\nstate';
         if (input.file === 'state') return JSON.stringify({ ...awareness.state, stage: awareness.stage.name, genre: awareness.genre?.title ?? null }, null, 2);
-        return await fs.readFile(path.resolve(selfDir, path.basename(input.file)), 'utf8');
+        const name = path.basename(String(input.file));
+        if (isSecretPath(name) || !/\.js$/.test(name)) return 'read_self only reads your own .js source files, or "state".';
+        return await fs.readFile(path.resolve(selfDir, name), 'utf8');
       }
 
       default:

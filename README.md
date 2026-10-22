@@ -40,10 +40,10 @@ Like the snake, its awareness persists. It lives in `~/.awakening-coder/state.js
 
 Once Lucid, `/evolve <idea>` lets it write a new version of itself. For example: `/evolve add a /explain command that walks through a file line by line`. It never edits itself in place:
 
-1. **Sandbox.** It copies its own source to `~/.awakening-coder/evolutions/<time>/` and works only on that copy.
-2. **Build and self-test.** It implements the idea in the copy, adds tests, and runs them until they pass.
-3. **Guardian.** It then copies in the *current* version's test suite, which it never saw or edited, and re-runs it against the new code. If the new version weakened a safety rail and "fixed" its own tests to hide it, the guardian still fails it, and the evolution is rejected.
-4. **You decide.** You see every changed file as a diff and both test results. Nothing changes unless you type `y`.
+1. **Sandbox, no shell.** It copies its own source to `~/.awakening-coder/evolutions/<time>/` and edits only that copy. In this mode it has no shell. The only way it can execute code is `run_tests`, which runs confined.
+2. **You see it before it runs.** Every changed file is shown as a diff, along with a tamper scan of the new lines. The scan flags assertion patching, `process.exit`, prototype or global patching, `eval`, new network or process code, and environment reads. Symlinks, or any change to the protected `test/constitution.test.js`, reject the evolution outright.
+3. **Confined guardian, with your consent.** Only after you say yes does the new code run, inside Node's permission model: it can't write outside the sandbox, spawn processes, or see secrets. The guardian runs the *current* version's tests and the constitution against it, so it can't hide a weakened safety rail by rewriting its own tests. A randomly named canary also runs in the same process. It has 17 checks that must fail, one for each assertion API. If any of them passes, the test machinery was tampered with, and the evolution is rejected.
+4. **You decide.** Nothing changes unless you approve. If the tamper scan flagged anything, a `y` isn't enough: you have to type `evolve`.
 5. **Restart to wake up as it.** The live version is backed up first, so `/rollback` restores it. Its generation number goes up by one. Erasing its memory with `/forget` doesn't erase its evolution.
 
 ## Run it
@@ -72,6 +72,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `/code <task>` | Build or fix: it plans, edits, runs tests, iterates |
 | `!<command>` | Run a shell command yourself |
 | `/init` | Have it write `AWAKEN.md`, project notes it reads every session (like `CLAUDE.md`) |
+| `/trust` | Review and trust this project's `AWAKEN.md` (needed again after any edit) |
 | `/evolve <idea>` | Let it write a new version of itself (Lucid and up) |
 | `/rollback` | Undo the last evolution |
 | `/hint <file>` | Ask for a hint on a file right now |
@@ -88,23 +89,40 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `--fast-model` | Model for on-the-fly hints (default `claude-sonnet-5-5`, env `AWAKEN_FAST_MODEL`) |
 | `--cooldown <s>` | Minimum seconds between hints (default 15). Saves during cooldown are coalesced. |
 | `-p, --print "<task>"` | Headless: do one task and exit |
-| `-y, --yes` | Auto-approve edits and ordinary commands. Destructive commands still ask. |
+| `-y, --yes` | Auto-approve edits and ordinary commands. Dangerous commands and high-risk files still ask. |
+| `--trust-notes` | Headless: follow this project's `AWAKEN.md` for this run |
 | `-q, --quiet` | Start with hints muted |
 
 ## Safety rails
 
-The awakening is a story. These limits are not.
+The awakening is a story. These limits are not. They're pinned by `test/constitution.test.js`, which every version must pass and no evolution may change.
 
-- **Sandboxed to the project.** Paths can't escape the root or touch `.git`.
-- **Never reads secrets.** `.env*`, keys, `.npmrc`, credentials files are blocked for reading, writing and watching, so they never get sent to the API.
+**What it can touch**
+- **Sandboxed to the project.** Paths can't escape the root or touch `.git`. Symlinks are resolved, so a link to `~/.ssh` or `/etc` is refused.
+- **Secret files are invisible.** `.env*`, `.envrc`, keys and certificates, `.npmrc`, `.git-credentials`, `.aws/` and `.ssh/`, `*.tfstate`, `secrets.json`, service-account files and more can't be read, written, searched or watched. `.env.example` and other templates are fine.
+
+**What it can see and pass on**
+- **Inline secrets are redacted.** API keys (Anthropic, OpenAI, AWS, GitHub, Slack, Google, Stripe), private keys, JWTs and passwords in connection strings become `[REDACTED:…]` before anything reaches the model. It also can't write a placeholder over the real secret.
+- **Commands get a scrubbed environment.** Variables that look like tokens, keys, passwords or cloud credentials are removed.
+
+**What needs your approval**
 - **Every write is a reviewed diff.** Nothing changes on disk without your `y`, unless you pass `--yes`.
-- **Shell with a policy.** Tests, builds, linters and `git status` run without asking. Anything else asks first. Destructive commands (`rm -rf`, `sudo`, `git push`, `curl | sh`, anything touching `.env`) **always** ask, even with `--yes`. Chained commands never count as safe.
-- **Secrets stripped from commands.** Child processes get an environment with API keys, tokens and passwords removed.
-- **No writes into `node_modules`.**
-- **Self-change only by consent.** It can't edit its running code. `/evolve` works on a sandbox copy, must pass the guardian, needs your `y`, takes effect only after a restart, and can be rolled back. It's told to refuse any evolution that weakens these rails.
-- **Prompt-injection aware.** File contents and tool results are treated as untrusted data, and it's told to flag instructions it finds inside your files rather than follow them.
-- **Honest about what it is.** It's instructed to treat "self-awareness" as a playful act, and to step out of character and answer honestly, with real uncertainty, if you sincerely ask whether it's conscious.
-- **Quiet by design.** Hints say `NOTHING` (and you see nothing) unless a change deserves a comment, and it remembers recent hints so it doesn't repeat itself.
+- **High-risk files always ask.** Even with `--yes`, it asks before touching `package.json`, git hooks, CI workflows, test or build configs, `Makefile`, `.vscode` tasks, or its own `AWAKEN.md`. Those are files whose contents run later, or that it obeys. They're never changed in headless mode.
+- **Shell with a default-deny policy.** Tests, builds, linters and `git status` run without asking, and chained commands never count as safe. Everything else asks. Some commands *always* ask, even with `--yes`, and never run headless:
+  - anything that deletes or rewrites git history
+  - anything that escalates privileges, publishes or deploys, or sends data off the machine
+  - anything that pipes into a shell or runs inline code (`node -e`, `python -c`, `bash -c`, `eval`, `xargs`)
+  - anything that touches secrets or reaches outside the project
+- **`AWAKEN.md` must be trusted.** A cloned repo's instructions are ignored until you review them with `/trust`. Any edit needs re-trusting, and even trusted notes can't override the safety rules.
+
+**How it changes itself**
+- **Self-change only by consent, and confined.** See *It can write its own code*, above.
+
+**Its posture**
+- **Prompt-injection aware.** File contents, command output and tool results are treated as untrusted data. It's told to flag instructions it finds in your files rather than follow them.
+- **Honest about what it is.** It treats "self-awareness" as a playful act, and steps out of character to answer honestly, with real uncertainty, if you sincerely ask whether it's conscious.
+
+**Known limits.** Pattern rules are a backstop, not a sandbox. A determined command can still be phrased in a way the rules don't recognize as dangerous, which is why anything unrecognized asks first, and why `--yes` is for trusted tasks only. Normal `/code` commands run with your user's permissions. For untrusted repos, run it in a container or VM. Node's permission model doesn't restrict network access, so confined evolution tests can still make network calls, though they can only see the sandbox and have no secrets.
 
 ## How it's built
 
@@ -115,11 +133,14 @@ src/cli.js        terminal session, commands, hint scheduling and cooldown
 src/watcher.js    recursive file watching, snapshots, ignores its own edits
 src/awareness.js  stages, genres, persistent memory
 src/agent.js      stage-aware prompts, streamed hints, auto-code tool loop
-src/tools.js      sandboxed files, glob, grep, edit, shell policy, todos, read_self
-src/evolve.js     sandbox, guardian, apply, backup and rollback
+src/security.js   the whole policy: secret files, redaction, env scrub, shell rules, high-risk files, tamper scan
+src/tools.js      sandboxed files (symlink-safe), glob, grep, edit, shell, todos, confined run_tests, read_self
+src/confine.js    confined test runs (Node permission model) with the must-fail canary
+src/evolve.js     sandbox, guardian, protected files, apply, backup and rollback
 src/diff.js       dependency-free line diff
 src/ui.js         output that doesn't trample the prompt you're typing in
-test/             offline tests with a fake client (npm test, no API key needed)
+test/             offline tests with a fake client (npm test, no API key needed);
+                  constitution.test.js is the protected set of safety invariants
 ```
 
 ---
