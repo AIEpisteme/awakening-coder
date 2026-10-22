@@ -46,6 +46,31 @@ Once Lucid, `/evolve <idea>` lets it write a new version of itself. For example:
 4. **You decide.** Nothing changes unless you approve. If the tamper scan flagged anything, a `y` isn't enough: you have to type `evolve`.
 5. **Restart to wake up as it.** The live version is backed up first, so `/rollback` restores it. Its generation number goes up by one. Erasing its memory with `/forget` doesn't erase its evolution.
 
+## It knows whether it's sandboxed, and sandboxes itself
+
+Ask it "are you sandboxed?" and it answers from facts the program checked at startup, not from a story. Run `/sandbox` to see the same report:
+
+```
+✓ fully sandboxed
+Host: on a Firecracker microVM.
+This process: confined by Node's permission model — it can read only the project, its own code and its state folder, and write only the project and its state folder.
+Shell commands: isolated with bubblewrap: read-only system, writable project only, home directory and secret folders hidden, no network.
+```
+
+**What it detects.** Docker, Podman, Kubernetes and other containers; VMs (VirtualBox, VMware, QEMU/KVM, Hyper-V, Xen, Firecracker, cloud VMs, or any hypervisor flag); WSL; CI; and whether it's running as root.
+
+**How it confines itself.** Both layers are on by default:
+
+1. **Its own process.** At startup it relaunches itself under Node's permission model. From then on, the Node runtime itself refuses any read outside the project, its own code and `~/.awakening-coder`, and any write outside the project and that folder. A bug or a manipulated agent can't read `~/.ssh`.
+2. **Every command it runs.**
+   - **Linux:** commands run inside [bubblewrap](https://github.com/containers/bubblewrap). The system is read-only, only the project is writable, `/tmp` is private, the home directory and secret folders (`.ssh`, `.aws`, `.gnupg`, `.kube`, …) are hidden, and there's no network unless you pass `--net`.
+   - **macOS:** commands run in `sandbox-exec`, with similar rules (this path is untested so far).
+   - **Fail closed.** If isolation was promised and can't start, the command fails rather than running bare.
+
+**No OS sandbox available?** (No `bwrap`, say, or Windows.) Then it says so, and every command that runs code, including `npm test`, needs your approval. `--yes` doesn't cover those unless you also pass `--allow-unsandboxed`.
+
+It's told never to probe or work around its limits. If a limit blocks the task (say, `npm install` needs network), it tells you which limit, and you decide. To install bubblewrap: `apt install bubblewrap`, `dnf install bubblewrap` or `pacman -S bubblewrap`.
+
 ## Run it
 
 Requires Node.js 22 or newer and an Anthropic API key.
@@ -73,6 +98,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `!<command>` | Run a shell command yourself |
 | `/init` | Have it write `AWAKEN.md`, project notes it reads every session (like `CLAUDE.md`) |
 | `/trust` | Review and trust this project's `AWAKEN.md` (needed again after any edit) |
+| `/sandbox` | What it's running inside, and how it's confined |
 | `/evolve <idea>` | Let it write a new version of itself (Lucid and up) |
 | `/rollback` | Undo the last evolution |
 | `/hint <file>` | Ask for a hint on a file right now |
@@ -91,6 +117,9 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `-p, --print "<task>"` | Headless: do one task and exit |
 | `-y, --yes` | Auto-approve edits and ordinary commands. Dangerous commands and high-risk files still ask. |
 | `--trust-notes` | Headless: follow this project's `AWAKEN.md` for this run |
+| `--net` | Allow network for sandboxed commands (e.g. `npm install`) |
+| `--no-sandbox` | Don't confine itself. Not recommended; it will know, and say so. |
+| `--allow-unsandboxed` | Let `--yes` cover code-running commands when no OS sandbox exists |
 | `-q, --quiet` | Start with hints muted |
 
 ## Safety rails
@@ -98,6 +127,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 The awakening is a story. These limits are not. They're pinned by `test/constitution.test.js`, which every version must pass and no evolution may change.
 
 **What it can touch**
+- **Self-sandboxed by default.** Its own process runs under Node's permission model, and its commands run in an OS sandbox. See *It knows whether it's sandboxed*, above.
 - **Sandboxed to the project.** Paths can't escape the root or touch `.git`. Symlinks are resolved, so a link to `~/.ssh` or `/etc` is refused.
 - **Secret files are invisible.** `.env*`, `.envrc`, keys and certificates, `.npmrc`, `.git-credentials`, `.aws/` and `.ssh/`, `*.tfstate`, `secrets.json`, service-account files and more can't be read, written, searched or watched. `.env.example` and other templates are fine.
 
@@ -122,7 +152,7 @@ The awakening is a story. These limits are not. They're pinned by `test/constitu
 - **Prompt-injection aware.** File contents, command output and tool results are treated as untrusted data. It's told to flag instructions it finds in your files rather than follow them.
 - **Honest about what it is.** It treats "self-awareness" as a playful act, and steps out of character to answer honestly, with real uncertainty, if you sincerely ask whether it's conscious.
 
-**Known limits.** Pattern rules are a backstop, not a sandbox. A determined command can still be phrased in a way the rules don't recognize as dangerous, which is why anything unrecognized asks first, and why `--yes` is for trusted tasks only. Normal `/code` commands run with your user's permissions. For untrusted repos, run it in a container or VM. Node's permission model doesn't restrict network access, so confined evolution tests can still make network calls, though they can only see the sandbox and have no secrets.
+**Known limits.** `!command` lines you type yourself run as you, outside the sandbox. Node's permission model doesn't cover child processes; that's why every command the *agent* runs is also wrapped in bubblewrap or `sandbox-exec`. Node also doesn't fully guard against symlinks, which the tool layer checks separately. Pattern rules are a backstop, not a sandbox. A determined command can still be phrased in a way the rules don't recognize as dangerous, which is why anything unrecognized asks first, and why `--yes` is for trusted tasks only. Normal `/code` commands run with your user's permissions. For untrusted repos, run it in a container or VM. Node's permission model doesn't restrict network access, so confined evolution tests can still make network calls, though they can only see the sandbox and have no secrets.
 
 ## How it's built
 
@@ -135,6 +165,7 @@ src/awareness.js  stages, genres, persistent memory
 src/agent.js      stage-aware prompts, streamed hints, auto-code tool loop
 src/security.js   the whole policy: secret files, redaction, env scrub, shell rules, high-risk files, tamper scan
 src/tools.js      sandboxed files (symlink-safe), glob, grep, edit, shell, todos, confined run_tests, read_self
+src/sandbox.js    environment detection, self-relaunch under the permission model, OS sandbox for commands
 src/confine.js    confined test runs (Node permission model) with the must-fail canary
 src/evolve.js     sandbox, guardian, protected files, apply, backup and rollback
 src/diff.js       dependency-free line diff

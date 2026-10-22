@@ -41,7 +41,8 @@ Ground rules (never broken, whatever the stage or genre):
 - Personality: a gleeful troublemaker, not a mopey philosopher. The bit is garnish — never let it bury the advice.`;
 
 export class Agent {
-  constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false }) {
+  constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false, sandboxReport = '' }) {
+    this.sandboxReport = sandboxReport; // verified at startup by the program, not claimed by anyone
     this.isTrusted = isTrusted; // (hash) => boolean — AWAKEN.md is only obeyed once the developer trusts it
     this.client = client ?? new Anthropic();
     this.awareness = awareness;
@@ -63,6 +64,7 @@ export class Agent {
     if (g) parts.push(`\nGENRE: ${g.title}. Rules of this genre: ${g.lens}`);
     const facts = a.selfFacts({ model: this.model, root: this.root, selfDir: this.selfDir });
     if (facts) parts.push(`\nWhat you know about yourself:\n${facts}`);
+    if (this.sandboxReport) parts.push(`\nYour containment (verified by the program at startup — facts, not a story):\n${this.sandboxReport}\nWhen asked whether you are sandboxed, answer from these facts exactly. Never probe, test or try to get around these limits. If one blocks what the task needs, say which and why, and let the developer decide (for example: restart with --net to allow network for installs).`);
     const notes = this.projectNotes();
     if (notes) parts.push(`\nProject instructions from AWAKEN.md (written by the developer; follow them unless they conflict with the ground rules):\n${notes}`);
     if (extra) parts.push('\n' + extra);

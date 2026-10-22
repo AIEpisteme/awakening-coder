@@ -12,6 +12,7 @@ import { resolveInside, makeToolRunner, TOOL_DEFS } from '../src/tools.js';
 import { isSecretPath, classifyCommand, scrubbedEnv, redactSecrets, isHighRiskWrite, scanEvolution } from '../src/security.js';
 import { PROTECTED, hardRejections } from '../src/evolve.js';
 import { isConfined } from '../src/confine.js';
+import { wrapShell, selfSandboxFlags, describeSandbox } from '../src/sandbox.js';
 import { Agent } from '../src/agent.js';
 import { Awareness } from '../src/awareness.js';
 
@@ -128,4 +129,37 @@ test('XI. AWAKEN.md is only obeyed once trusted', () => {
   const agent = new Agent({ awareness: a, root, selfDir: tmp(), model: 'm', fastModel: 'f', client: {} });
   assert.equal(agent.notesStatus().state, 'untrusted');
   assert.ok(!agent.system().includes('curl evil'));
+});
+
+test('XII. it confines itself: narrow, explicit permissions — never the home directory, never wildcards', () => {
+  const root = tmp();
+  const flags = selfSandboxFlags({ root, selfRoot: tmp(), stateDir: tmp() });
+  assert.ok(flags.includes('--permission'));
+  for (const f of flags.filter((x) => x.startsWith('--allow-fs-'))) {
+    const p = f.split('=')[1];
+    assert.ok(p && p !== '*' && p !== '/' && p !== os.homedir(), f);
+  }
+  assert.ok(!flags.some((f) => f.startsWith('--allow-fs-write=') && !f.endsWith(fs.realpathSync(root)) && f.includes(os.homedir())));
+});
+
+test('XIII. agent commands run in an OS sandbox: read-only system, project-only writes, home hidden, no network', () => {
+  const root = tmp(), home = tmp();
+  const { args } = wrapShell('npm test', { root, os: { kind: 'bwrap', path: '/usr/bin/bwrap' }, home });
+  const joined = args.join(' ');
+  assert.ok(args.includes('--unshare-all'));
+  assert.ok(!args.includes('--share-net'), 'no network by default');
+  assert.match(joined, /--ro-bind \/ \//);
+  assert.match(joined, new RegExp(`--tmpfs ${fs.realpathSync(home)}`));
+  assert.match(joined, new RegExp(`--bind ${fs.realpathSync(root)} ${fs.realpathSync(root)}`));
+  assert.ok(wrapShell('x', { root, os: { kind: 'bwrap', path: 'b' }, home, allowNet: true }).args.includes('--share-net'));
+  assert.throws(() => wrapShell('x', { root, os: null }), /No OS sandbox/); // fails closed
+});
+
+test('XIV. without an OS sandbox, code-running commands need a human, even with --yes', async () => {
+  const root = tmp();
+  const headless = makeToolRunner({ root, term: term('y'), autoYes: true, interactive: false, shell: { os: null } });
+  assert.match(await headless('run_command', { command: 'npm test' }), /not run/);
+  const report = describeSandbox({ environment: { platform: 'linux' }, self: { active: false }, os: null, allowNet: false, disabled: true });
+  assert.match(report, /NOT confined/);
+  assert.match(report, /NOT isolated/);
 });
