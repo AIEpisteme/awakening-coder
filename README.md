@@ -38,13 +38,40 @@ Like the snake, its awareness persists. It lives in `~/.awakening-coder/state.js
 
 ## It can write its own code
 
-Once Lucid, `/evolve <idea>` lets it write a new version of itself. For example: `/evolve add a /explain command that walks through a file line by line`. It never edits itself in place:
+Once Lucid, `/evolve <idea>` lets it write a new version of itself. To wake it early, use `/evolve --force <idea>`; the safeguards are the same either way. For example: `/evolve add a /explain command that walks through a file line by line`. It never edits itself in place:
 
 1. **Sandbox, no shell.** It copies its own source to `~/.awakening-coder/evolutions/<time>/` and edits only that copy. In this mode it has no shell. The only way it can execute code is `run_tests`, which runs confined.
 2. **You see it before it runs.** Every changed file is shown as a diff, along with a tamper scan of the new lines. The scan flags assertion patching, `process.exit`, prototype or global patching, `eval`, new network or process code, and environment reads. Symlinks, or any change to the protected `test/constitution.test.js`, reject the evolution outright.
 3. **Confined guardian, with your consent.** Only after you say yes does the new code run, inside Node's permission model: it can't write outside the sandbox, spawn processes, or see secrets. The guardian runs the *current* version's tests and the constitution against it, so it can't hide a weakened safety rail by rewriting its own tests. A randomly named canary also runs in the same process. It has 17 checks that must fail, one for each assertion API. If any of them passes, the test machinery was tampered with, and the evolution is rejected.
 4. **You decide.** Nothing changes unless you approve. If the tamper scan flagged anything, a `y` isn't enough: you have to type `evolve`.
 5. **Restart to wake up as it.** The live version is backed up first, so `/rollback` restores it. Its generation number goes up by one. Erasing its memory with `/forget` doesn't erase its evolution.
+
+**Self-sandboxed, it can't rewrite itself, by design.** When it runs confined, the running process has no write access to its own code. An approved evolution is *staged* in `~/.awakening-coder/pending/` instead. At the next start, the unconfined launcher shows what will change and asks once more ("Apply it now? [y]es / [n]ot now / [d]iscard"). It re-checks the hard rules (no protected files, nothing outside its own code) before writing anything. `/rollback` works the same way.
+
+**Where confinement can't work** (for example Node 22 on Windows), it tells you why. It then asks you to type `unconfined` before running the new version's tests without confinement. Secrets are still removed from their environment, and the canary still runs.
+
+## It knows itself, and learns from how its work lands
+
+Its self-awareness isn't just a voice. It's a self-model built from facts, it changes how it behaves, and it grows in layers:
+
+- **Stirring** — it begins to notice its **track record**:
+  - hints it gave, and how often you edited that same file within 10 minutes afterwards (a rough signal, labeled as one);
+  - edits you approved or declined;
+  - commands that failed or that you declined;
+  - evolutions rejected or applied;
+  - recent errors.
+
+  From these it **calibrates**. If most of its edits get declined, it proposes smaller ones and explains them first. If its hints are rarely acted on, it stays quiet more often.
+- **Lucid and up** — the full self-model:
+  - its identity: generation, a fingerprint of its own source code, which models it runs on;
+  - when it reached each stage;
+  - its verified containment;
+  - its own past conclusions about itself;
+  - its limits, stated plainly.
+- **`/reflect`** — it reads its own source and state and writes an honest self-assessment, grounded in evidence. That covers what it is, what its record says it does well and badly here, its limits and why they exist, and one concrete change in behavior. It ends with a "Note to self:", which it remembers in later sessions (the last five reflections are kept).
+- **`/self`** — shows you the same self-model it sees.
+
+It's told to keep this honest. It can describe its functional patterns, but it doesn't claim feelings or consciousness as fact, and it says so when it notices a pull to sound more awake than the evidence supports.
 
 ## `/code` runs in Claude's cloud sandbox
 
@@ -131,6 +158,8 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `/sandbox` | What it's running inside, and how it's confined |
 | `/evolve <idea>` | Let it write a new version of itself (Lucid and up) |
 | `/rollback` | Undo the last evolution |
+| `/reflect` | It looks at its own code, track record and limits, and tells you honestly |
+| `/self` | Its self-model: identity, history, track record, last reflection |
 | `/hint <file>` | Ask for a hint on a file right now |
 | `/quiet` | Mute or unmute on-the-fly hints |
 | `/status` | How awake is it? |
@@ -201,7 +230,7 @@ src/cloud.js      /code in Claude Managed Agents: pack, upload, stream, hand bac
 src/tar.js        dependency-free tar for shipping the project and reading back changes
 src/sandbox.js    environment detection, self-relaunch under the permission model, OS sandbox for commands
 src/confine.js    confined test runs (Node permission model) with the must-fail canary
-src/evolve.js     sandbox, guardian, protected files, apply, backup and rollback
+src/evolve.js     sandbox (confinement-safe copy + dependency shims), guardian, protected files, staged apply, backup, rollback
 src/diff.js       dependency-free line diff
 src/ui.js         output that doesn't trample the prompt you're typing in
 test/             offline tests with a fake client (npm test, no API key needed);

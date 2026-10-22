@@ -214,6 +214,7 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
     term.print(`${c.bold(`\n✎ ${before === '' ? 'create' : 'edit'} ${rel}`)}${risky ? c.red('  ⚠ this file controls what runs or what I obey later') : ''}\n${colorDiff(diff)}`);
     // High-risk files always need a human, even with --yes (and never apply non-interactively).
     if ((risky || !autoWrites) && !(await approve(risky ? c.red('Apply this high-risk change?') : 'Apply this change?'))) {
+      if (interactive) awareness?.note('editsDeclined');
       return interactive
         ? 'The developer declined this change. Ask what they would prefer, or try a different approach.'
         : `Change not applied: running non-interactively${risky ? ' and this is a high-risk file that always needs a human' : ' without --yes'}.`;
@@ -222,6 +223,7 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
     onWrite?.(rel, after); // so the watcher doesn't "suggest" on our own edit
     await fs.writeFile(abs, after);
     awareness?.feed('accept', rel);
+    awareness?.note('editsApproved');
     return `Wrote ${rel} (${after.split('\n').length} lines).`;
   }
 
@@ -293,11 +295,13 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
         const tag = isolated ? c.dim(' [sandboxed]') : c.yellow(' [NOT sandboxed]');
         term.print(`${kind === 'danger' ? c.red(`\n⚠ (${why}) $ `) : c.bold('\n$ ')}${cmd}${tag}`);
         const ok = kind === 'auto' || (kind === 'ask' && autoOk) || (await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : `Run this command${isolated ? '' : ' outside any sandbox'}?`));
+        if (!ok && interactive) awareness?.note('commandsDeclined');
         if (!ok) return interactive ? 'The developer declined to run this command.' : `Command not run: non-interactive mode cannot approve it (${isolated ? 'use --yes for ordinary commands' : 'no OS sandbox is available, so --yes does not cover commands that execute code'}; destructive ones are never auto-approved).`;
         const timeoutMs = Math.min(600, Math.max(1, Number(input.timeout_seconds) || 120)) * 1000;
         // Fail closed: if isolation was promised, the command runs isolated or not at all.
         const wrap = isolated ? wrapShell(cmd, { root, os: shell.os, allowNet: shell.allowNet }) : null;
         const { code, signal: sig, out } = await runShell(cmd, { cwd: root, timeoutMs, signal, wrap });
+        awareness?.note(code === 0 ? 'commandsRun' : 'commandsFailed');
         const tail = redactSecrets(out).trim().split('\n').slice(-6).join('\n');
         term.print(c.dim(tail ? tail.replace(/^/gm, '  ') : '  (no output)') + (code === 0 ? '' : c.yellow(`\n  exit ${code ?? sig}`)));
         return `exit code: ${code ?? `killed (${sig})`}\n${redactSecrets(out) || '(no output)'}`;

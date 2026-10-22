@@ -137,11 +137,11 @@ test('workspace ID is sent as the anthropic-workspace-id header', async () => {
     return new Response(JSON.stringify({ id: 'm', type: 'message', role: 'assistant', model: 'x', content: [], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }),
       { status: 200, headers: { 'content-type': 'application/json' } });
   };
-  const withId = makeClient({ workspaceId: 'wrkspc_123' });
+  const withId = makeClient({ workspaceId: 'wrkspc_123', apiKey: 'test' }); // explicit key: no config-file lookup
   withId.fetch = fakeFetch;
   withId.apiKey = 'test';
   await withId.messages.create({ model: 'x', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] });
-  const without = makeClient({ workspaceId: '' });
+  const without = makeClient({ workspaceId: '', apiKey: 'test' });
   without.fetch = fakeFetch;
   without.apiKey = 'test';
   await without.messages.create({ model: 'x', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] });
