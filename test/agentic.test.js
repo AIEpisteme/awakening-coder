@@ -61,7 +61,11 @@ test('non-interactive mode cannot approve anything; --yes never covers destructi
   const headless = makeToolRunner({ root, term: quietTerm('y'), interactive: false });
   assert.match(await headless('edit_file', { path: 'f.js', old_str: 'a', new_str: 'b' }), /not applied/);
   assert.match(await headless('run_command', { command: 'echo hi > x' }), /not run/);
-  const yes = makeToolRunner({ root, term: quietTerm('y'), autoYes: true, interactive: false });
+  // No OS sandbox here, so --yes alone must not run code-executing commands…
+  const yesBare = makeToolRunner({ root, term: quietTerm('y'), autoYes: true, interactive: false });
+  assert.match(await yesBare('run_command', { command: 'echo ok' }), /not run/);
+  // …unless the developer explicitly accepts running unsandboxed.
+  const yes = makeToolRunner({ root, term: quietTerm('y'), autoYes: true, interactive: false, shell: { allowUnsandboxed: true } });
   assert.match(await yes('run_command', { command: 'echo ok' }), /exit code: 0\nok/);
   assert.match(await yes('run_command', { command: 'rm -rf f.js' }), /not run/);
   assert.ok(fs.existsSync(path.join(root, 'f.js')));

@@ -78,6 +78,12 @@ const DANGER_RULES = [
   ['reaches outside the project', /(^|[\s='"])(~|\$HOME|\$\{HOME\}|\.\.(\/|\\|$))|(^|[\s='"])\/(?!dev\/null\b)[A-Za-z]/],
 ];
 
+// Commands that only read repository/system state and execute no project code.
+const READ_ONLY_CMD = /^(git (status|diff|log|show|branch)\b|ls\b|pwd$|node --version$)/;
+
+/** True if the command may execute project code (tests, builds, scripts) — so it needs isolation or a human. */
+export const executesCode = (cmd) => !READ_ONLY_CMD.test(String(cmd).trim());
+
 /**
  * Classify a shell command:
  *   'auto'   — on the short list of read-only/test commands, with no shell metacharacters

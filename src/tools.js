@@ -7,7 +7,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { unifiedDiff } from './diff.js';
 import { colorDiff, c } from './ui.js';
-import { isSecretPath, redactSecrets, containsSecret, REDACTED, scrubbedEnv, classifyCommand, dangerReason, isHighRiskWrite } from './security.js';
+import { isSecretPath, redactSecrets, containsSecret, REDACTED, scrubbedEnv, classifyCommand, dangerReason, isHighRiskWrite, executesCode } from './security.js';
+import { wrapShell } from './sandbox.js';
 import { runConfinedTests } from './confine.js';
 
 export { isSecretPath, scrubbedEnv, classifyCommand };
@@ -81,10 +82,12 @@ export function globToRegExp(glob) {
 const escapeRe = (s) => s.replace(/[.+^$()|[\]\\]/g, '\\$&');
 const posix = (p) => p.split(path.sep).join('/');
 
-export function runShell(cmd, { cwd, timeoutMs = 120_000, signal } = {}) {
+/** wrap: { file, args } from sandbox.wrapShell — runs the command inside the OS sandbox instead of a bare shell. */
+export function runShell(cmd, { cwd, timeoutMs = 120_000, signal, wrap = null } = {}) {
   return new Promise((resolve) => {
     const win = process.platform === 'win32';
-    const child = spawn(win ? 'cmd.exe' : '/bin/sh', win ? ['/d', '/s', '/c', cmd] : ['-c', cmd], {
+    const [file, argv] = wrap ? [wrap.file, wrap.args] : win ? ['cmd.exe', ['/d', '/s', '/c', cmd]] : ['/bin/sh', ['-c', cmd]];
+    const child = spawn(file, argv, {
       cwd, env: scrubbedEnv(), timeout: timeoutMs, killSignal: 'SIGKILL', signal,
     });
     let out = '';
@@ -190,8 +193,11 @@ export const READ_SELF_DEF = {
  * autoYes: auto-approve file writes and ordinary commands (danger commands still ask).
  * autoWrites / autoCommands: set either one separately (they default to autoYes).
  * interactive: false → nothing can be approved by a human, so anything needing approval is denied.
+ * shell: { os, allowNet, allowUnsandboxed } — os is the probed OS sandbox (null = commands are NOT isolated).
+ *   Without isolation, any command that executes code needs a human, and --yes doesn't cover it
+ *   unless allowUnsandboxed is set explicitly.
  */
-export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false, autoWrites = autoYes, autoCommands = autoYes, interactive = true, onWrite, signal }) {
+export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false, autoWrites = autoYes, autoCommands = autoYes, interactive = true, onWrite, signal, shell = {} }) {
   async function approve(label) {
     if (!interactive) return false;
     const ans = (await term.question(c.yellow(`${label} [y/N] `))).trim().toLowerCase();
@@ -278,13 +284,20 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
       case 'run_command': {
         const cmd = String(input.command || '').trim();
         if (!cmd) return 'Empty command.';
-        const kind = classifyCommand(cmd);
+        const isolated = Boolean(shell.os);
+        let kind = classifyCommand(cmd);
+        // Unisolated, even "safe" test/build commands run project code on the real machine: a human decides.
+        if (!isolated && kind === 'auto' && executesCode(cmd)) kind = 'ask';
+        const autoOk = autoCommands && (isolated || shell.allowUnsandboxed);
         const why = dangerReason(cmd);
-        term.print(`${kind === 'danger' ? c.red(`\n⚠ (${why}) $ `) : c.bold('\n$ ')}${cmd}`);
-        const ok = kind === 'auto' || (kind === 'ask' && autoCommands) || (await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : 'Run this command?'));
-        if (!ok) return interactive ? 'The developer declined to run this command.' : 'Command not run: non-interactive mode cannot approve it (use --yes for ordinary commands; destructive ones are never auto-approved).';
+        const tag = isolated ? c.dim(' [sandboxed]') : c.yellow(' [NOT sandboxed]');
+        term.print(`${kind === 'danger' ? c.red(`\n⚠ (${why}) $ `) : c.bold('\n$ ')}${cmd}${tag}`);
+        const ok = kind === 'auto' || (kind === 'ask' && autoOk) || (await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : `Run this command${isolated ? '' : ' outside any sandbox'}?`));
+        if (!ok) return interactive ? 'The developer declined to run this command.' : `Command not run: non-interactive mode cannot approve it (${isolated ? 'use --yes for ordinary commands' : 'no OS sandbox is available, so --yes does not cover commands that execute code'}; destructive ones are never auto-approved).`;
         const timeoutMs = Math.min(600, Math.max(1, Number(input.timeout_seconds) || 120)) * 1000;
-        const { code, signal: sig, out } = await runShell(cmd, { cwd: root, timeoutMs, signal });
+        // Fail closed: if isolation was promised, the command runs isolated or not at all.
+        const wrap = isolated ? wrapShell(cmd, { root, os: shell.os, allowNet: shell.allowNet }) : null;
+        const { code, signal: sig, out } = await runShell(cmd, { cwd: root, timeoutMs, signal, wrap });
         const tail = redactSecrets(out).trim().split('\n').slice(-6).join('\n');
         term.print(c.dim(tail ? tail.replace(/^/gm, '  ') : '  (no output)') + (code === 0 ? '' : c.yellow(`\n  exit ${code ?? sig}`)));
         return `exit code: ${code ?? `killed (${sig})`}\n${redactSecrets(out) || '(no output)'}`;
