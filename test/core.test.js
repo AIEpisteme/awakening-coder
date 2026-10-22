@@ -7,7 +7,7 @@ import path from 'node:path';
 import { unifiedDiff, changedLineCount } from '../src/diff.js';
 import { resolveInside, makeToolRunner } from '../src/tools.js';
 import { Awareness } from '../src/awareness.js';
-import { Agent } from '../src/agent.js';
+import { Agent, makeClient, explainApiError } from '../src/agent.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'awaken-'));
 
@@ -128,4 +128,29 @@ test('$ sequences in edits stay literal', async () => {
   const runTool = makeToolRunner({ root, selfDir: '/s', awareness: a, term: { print() {} }, autoYes: true });
   await runTool('edit_file', { path: 'p.js', old_str: 'X', new_str: "'$&$1'" });
   assert.equal(fs.readFileSync(path.join(root, 'p.js'), 'utf8'), "const price = '$&$1';\n");
+});
+
+test('workspace ID is sent as the anthropic-workspace-id header', async () => {
+  const sent = [];
+  const fakeFetch = async (url, init) => {
+    sent.push(new Headers(init.headers).get('anthropic-workspace-id'));
+    return new Response(JSON.stringify({ id: 'm', type: 'message', role: 'assistant', model: 'x', content: [], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }),
+      { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const withId = makeClient({ workspaceId: 'wrkspc_123' });
+  withId.fetch = fakeFetch;
+  withId.apiKey = 'test';
+  await withId.messages.create({ model: 'x', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] });
+  const without = makeClient({ workspaceId: '' });
+  without.fetch = fakeFetch;
+  without.apiKey = 'test';
+  await without.messages.create({ model: 'x', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] });
+  assert.deepEqual(sent, ['wrkspc_123', null]);
+});
+
+test('the unscoped-key error gets a clear fix', () => {
+  const fix = explainApiError(new Error('400 {"error":{"message":"This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id header"}}'));
+  assert.match(fix, /ANTHROPIC_WORKSPACE_ID/);
+  assert.match(fix, /--workspace/);
+  assert.equal(explainApiError(new Error('500 overloaded')), null);
 });

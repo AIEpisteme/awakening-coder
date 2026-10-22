@@ -7,7 +7,7 @@ import readline from 'node:readline';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { Awareness, GENRES, STAGES, homeDir } from './awareness.js';
-import { Agent, notesHash } from './agent.js';
+import { Agent, notesHash, makeClient, explainApiError } from './agent.js';
 import { startWatcher } from './watcher.js';
 import { makeToolRunner, resolveInside, runShell } from './tools.js';
 import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback, hardRejections } from './evolve.js';
@@ -34,6 +34,7 @@ const { values: opt, positionals } = parseArgs({
     'no-sandbox': { type: 'boolean', default: false },
     net: { type: 'boolean', default: false },
     'allow-unsandboxed': { type: 'boolean', default: false },
+    workspace: { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   },
 });
@@ -54,6 +55,8 @@ Options
   --net                 allow network for sandboxed commands (e.g. npm install)
   --no-sandbox          don't confine itself (not recommended; it will know, and say so)
   --allow-unsandboxed   let --yes cover code-running commands when no OS sandbox exists
+  --workspace <id>      Claude API workspace ID, for keys not scoped to a workspace
+                        (or set ANTHROPIC_WORKSPACE_ID)
   -q, --quiet           start with on-the-fly hints muted
   --forget              erase its memory and start over, truly innocent
 
@@ -110,7 +113,8 @@ const awareness = new Awareness();
 if (opt.forget) awareness.forget();
 let headlessTrust = null;
 const isTrusted = (hash) => awareness.notesTrusted(root, hash) || (headlessTrust !== null && headlessTrust === hash);
-const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport });
+const client = makeClient({ workspaceId: opt.workspace ?? process.env.ANTHROPIC_WORKSPACE_ID });
+const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client });
 
 // ======================================================================
 // Headless mode:  awaken -p "add input validation to src/api.js" .
@@ -137,6 +141,8 @@ if (opt.print !== undefined) {
     process.exit(0);
   } catch (e) {
     console.error(c.red(`error: ${e.message}`));
+    const fix = explainApiError(e);
+    if (fix) console.error(c.yellow(fix));
     process.exit(1);
   }
 }
@@ -175,7 +181,8 @@ async function hint(change) {
     if (out !== null) term.endStream();
   } catch (e) {
     if (term.streaming) term.endStream();
-    term.print(c.red(`hint failed: ${e.message}`));
+    const fix = explainApiError(e);
+    term.print(c.red(`hint failed: ${e.message}`) + (fix ? '\n' + c.yellow('  ' + fix) : ''));
   }
 }
 
@@ -212,7 +219,8 @@ async function runAgent(theAgent, text, mode, runnerOpts, header) {
     });
     return true;
   } catch (e) {
-    term.write(currentAbort.signal.aborted ? c.yellow('\n[interrupted]') : c.red(`\nerror: ${e.message}`));
+    const fix = explainApiError(e);
+    term.write(currentAbort.signal.aborted ? c.yellow('\n[interrupted]') : c.red(`\nerror: ${e.message}`) + (fix ? '\n' + c.yellow('  ' + fix) : ''));
     return false;
   } finally {
     term.write('\n');

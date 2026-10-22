@@ -89,6 +89,15 @@ On Windows, put paths with spaces in quotes:
 node src/cli.js "C:\Users\you\OneDrive - Company\Documents\my-project"
 ```
 
+If your API key isn't scoped to a workspace, you'll see *"This API key is not scoped to a workspace…"*. Tell it which workspace to use. Copy the workspace ID from the Claude Console, then do one of the following:
+
+```bash
+export ANTHROPIC_WORKSPACE_ID=wrkspc_...      # PowerShell: $env:ANTHROPIC_WORKSPACE_ID="wrkspc_..."
+# or add ANTHROPIC_WORKSPACE_ID=wrkspc_... to the .env file, or pass --workspace wrkspc_...
+```
+
+Alternatively, create a key inside a workspace and use that instead.
+
 Then just code in your editor as usual. Hints appear in the terminal as you save.
 
 Headless, like `claude -p`. It does one task, prints the result and exits, for scripts and CI:
@@ -127,6 +136,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `--trust-notes` | Headless: follow this project's `AWAKEN.md` for this run |
 | `--net` | Allow network for sandboxed commands (e.g. `npm install`) |
 | `--no-sandbox` | Don't confine itself. Not recommended; it will know, and say so. |
+| `--workspace <id>` | Claude API workspace ID, for keys not scoped to a workspace (or `ANTHROPIC_WORKSPACE_ID`) |
 | `--allow-unsandboxed` | Let `--yes` cover code-running commands when no OS sandbox exists |
 | `-q, --quiet` | Start with hints muted |
 
