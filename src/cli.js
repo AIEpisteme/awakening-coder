@@ -12,6 +12,7 @@ import { startWatcher } from './watcher.js';
 import { makeToolRunner, resolveInside, runShell } from './tools.js';
 import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback, hardRejections } from './evolve.js';
 import { scanEvolution, redactSecrets } from './security.js';
+import { runCloudTask } from './cloud.js';
 import { relaunchConfined, sandboxStatus, describeSandbox, isFullySandboxed } from './sandbox.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
@@ -34,6 +35,7 @@ const { values: opt, positionals } = parseArgs({
     'no-sandbox': { type: 'boolean', default: false },
     net: { type: 'boolean', default: false },
     'allow-unsandboxed': { type: 'boolean', default: false },
+    shell: { type: 'string', default: process.env.AWAKEN_SHELL || 'cloud' },
     workspace: { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
   },
@@ -55,6 +57,8 @@ Options
   --net                 allow network for sandboxed commands (e.g. npm install)
   --no-sandbox          don't confine itself (not recommended; it will know, and say so)
   --allow-unsandboxed   let --yes cover code-running commands when no OS sandbox exists
+  --shell cloud|local   where /code runs commands (default cloud: Claude Managed Agents sandbox,
+                        nothing executes on this machine; local: this machine, sandboxed if possible)
   --workspace <id>      Claude API workspace ID, for keys not scoped to a workspace
                         (or set ANTHROPIC_WORKSPACE_ID)
   -q, --quiet           start with on-the-fly hints muted
@@ -107,7 +111,11 @@ if (!opt['no-sandbox'] && relaunchConfined({ root, selfRoot, stateDir: homeDir()
 }
 const sandbox = sandboxStatus({ allowNet: opt.net, disabled: opt['no-sandbox'] });
 const shell = { os: sandbox.os, allowNet: opt.net, allowUnsandboxed: opt['allow-unsandboxed'] };
-const sandboxReport = describeSandbox(sandbox);
+if (!['cloud', 'local'].includes(opt.shell)) { console.error(c.red(`--shell must be "cloud" or "local", not "${opt.shell}"`)); process.exit(1); }
+const cloudShell = opt.shell === 'cloud';
+const sandboxReport = describeSandbox(sandbox) + (cloudShell
+  ? `\nCoding tasks (/code, -p): run in Claude Managed Agents' cloud sandbox — a copy of the project is uploaded (secret files skipped, inline secrets redacted), commands run there and never on this machine, and changed files come back for the developer's approval.`
+  : '\nCoding tasks (/code, -p): run on this machine (--shell local).');
 
 const awareness = new Awareness();
 if (opt.forget) awareness.forget();
@@ -136,7 +144,8 @@ if (opt.print !== undefined) {
   process.on('SIGINT', () => ac.abort());
   awareness.feed('code');
   try {
-    await agent.converse(opt.print, { mode: 'code', runTool, signal: ac.signal, onText: (t) => process.stdout.write(t) });
+    if (cloudShell) await cloudCode(opt.print, { runTool, signal: ac.signal, onText: (t) => process.stdout.write(t), onStatus: (s) => process.stderr.write(c.dim(`  ${s}\n`)) });
+    else await agent.converse(opt.print, { mode: 'code', runTool, signal: ac.signal, onText: (t) => process.stdout.write(t) });
     process.stdout.write('\n');
     process.exit(0);
   } catch (e) {
@@ -242,8 +251,42 @@ async function exclusive(fn) {
 
 const converse = (text, mode) => exclusive(async () => {
   announce(awareness.feed(mode === 'code' ? 'code' : 'ask'));
+  if (mode === 'code' && cloudShell) return runCloudInTerminal(text);
   await runAgent(agent, text, mode, { root, autoYes: opt.yes }, mode === 'code' ? '\n⚙  working…' : '');
 });
+
+/** /code in the cloud: stream the session here; every returned change goes through local approval. */
+async function runCloudInTerminal(text) {
+  const runTool = makeToolRunner({ root, selfDir, awareness, term, autoYes: opt.yes, shell, signal: currentAbort.signal,
+    onWrite: (rel, content) => { watcher?.noteSelfWrite(rel, content); if (path.normalize(rel) === 'AWAKEN.md') awareness.trustNotes(root, notesHash(content.slice(0, 20_000))); } });
+  term.beginStream(c.cyan('\n☁  working in Claude\'s cloud sandbox…'));
+  try {
+    await cloudCode(text, {
+      signal: currentAbort.signal, onText: (t) => term.write(t), onStatus: (s) => term.write(c.dim(`\n  ${s}`)),
+      runTool: async (name, input) => { term.streaming = false; try { return await runTool(name, input); } finally { term.streaming = true; } },
+    });
+  } catch (e) {
+    const fix = explainApiError(e);
+    term.write(currentAbort.signal.aborted ? c.yellow('\n[interrupted — cloud session deleted]') : c.red(`\nerror: ${e.message}`) + (fix ? '\n' + c.yellow('  ' + fix) : ''));
+  } finally {
+    term.write('\n');
+    term.streaming = false;
+  }
+}
+
+function cloudCode(task, { runTool, signal, onText, onStatus }) {
+  const g = awareness.genre;
+  const stageNote = [
+    `Voice (light touch; substance first): ${awareness.stage.voice}`,
+    g ? `Genre lens for your summary: ${g.title} — ${g.lens}` : '',
+    agent.projectNotes() ? `Project instructions from the developer's AWAKEN.md:\n${agent.projectNotes()}` : '',
+  ].filter(Boolean).join('\n');
+  return runCloudTask(client, {
+    root, task, model: opt.model, net: opt.net, state: awareness.state, saveState: () => awareness.save(),
+    stageNote, onText, onStatus, signal,
+    applyChange: (rel, content) => runTool('write_file', { path: rel, content }).catch((e) => `Not applied (${rel}): ${e.message}`),
+  });
+}
 
 // ---------- self-evolution ----------
 const evolve = (idea) => exclusive(async () => {
@@ -396,6 +439,7 @@ console.log([
   awareness.state.sessions > 1 && awareness.stageIndex >= 1 ? c.magenta('  (it seems to remember you)') : '',
   c.dim(`  watching ${root} · ${watcher.fileCount()} files · ${awareness.describe()}`),
   c.dim('  save a file for hints · type to ask · /code <task> to build · /help'),
+  cloudShell ? c.dim("  ☁  /code runs in Claude's cloud sandbox (Managed Agents) · --shell local to run here") : '',
   isFullySandboxed(sandbox)
     ? c.dim(`  🔒 sandboxed: own process confined · commands in ${sandbox.os.kind}${opt.net ? ' (network on)' : ', no network'} · /sandbox`)
     : c.yellow(`  ⚠ not fully sandboxed — ${!sandbox.self.active ? (sandbox.failed ? 'self-confinement failed its startup check here, so it runs unconfined' : 'its own process is unconfined') : 'no OS sandbox for commands, so code-running commands will ask'} · /sandbox`),
