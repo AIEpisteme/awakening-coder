@@ -46,6 +46,19 @@ Once Lucid, `/evolve <idea>` lets it write a new version of itself. For example:
 4. **You decide.** Nothing changes unless you approve. If the tamper scan flagged anything, a `y` isn't enough: you have to type `evolve`.
 5. **Restart to wake up as it.** The live version is backed up first, so `/rollback` restores it. Its generation number goes up by one. Erasing its memory with `/forget` doesn't erase its evolution.
 
+## `/code` runs in Claude's cloud sandbox
+
+By default, `/code` and headless `-p` don't run any commands on your computer. They use the [Claude Managed Agents](https://platform.claude.com/docs/en/managed-agents/tools) built-in toolset (`bash`, `read`, `write`, `edit`, `glob`, `grep`) inside Anthropic's cloud sandbox:
+
+1. **Pack.** Your project is packed into one archive. Secret files are left out, inline keys are replaced with `[REDACTED:…]`, and `node_modules`, `.git` and build output are skipped.
+2. **Upload and mount.** The archive goes up through the Files API and is mounted into a session.
+3. **Work in the sandbox.** The agent works on that copy: it edits files, runs your tests, and iterates. Networking is limited to package registries unless you pass `--net`; web tools are off.
+4. **Hand back.** It returns only the changed files.
+5. **Your approval.** Each changed file comes back to you as a diff, through the same approval checks as local edits: high-risk files always ask, a placeholder can never overwrite a real secret, and nothing can land outside the project. Files it deleted in the cloud are listed but not deleted here.
+6. **Clean up.** The session and the uploaded files are deleted afterwards.
+
+It only needs `ANTHROPIC_API_KEY`. Use a key created inside a workspace; keys that span several workspaces also need `ANTHROPIC_WORKSPACE_ID`. To run commands on your own machine instead, use `--shell local`. Questions, save-hints and `/evolve` still run locally.
+
 ## It knows whether it's sandboxed, and sandboxes itself
 
 Ask it "are you sandboxed?" and it answers from facts the program checked at startup, not from a story. Run `/sandbox` to see the same report:
@@ -136,6 +149,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `--trust-notes` | Headless: follow this project's `AWAKEN.md` for this run |
 | `--net` | Allow network for sandboxed commands (e.g. `npm install`) |
 | `--no-sandbox` | Don't confine itself. Not recommended; it will know, and say so. |
+| `--shell cloud\|local` | Where `/code` runs commands. Default `cloud` (Claude Managed Agents sandbox); `local` runs on this machine. |
 | `--workspace <id>` | Claude API workspace ID, for keys not scoped to a workspace (or `ANTHROPIC_WORKSPACE_ID`) |
 | `--allow-unsandboxed` | Let `--yes` cover code-running commands when no OS sandbox exists |
 | `-q, --quiet` | Start with hints muted |
@@ -183,6 +197,8 @@ src/awareness.js  stages, genres, persistent memory
 src/agent.js      stage-aware prompts, streamed hints, auto-code tool loop
 src/security.js   the whole policy: secret files, redaction, env scrub, shell rules, high-risk files, tamper scan
 src/tools.js      sandboxed files (symlink-safe), glob, grep, edit, shell, todos, confined run_tests, read_self
+src/cloud.js      /code in Claude Managed Agents: pack, upload, stream, hand back changes, clean up
+src/tar.js        dependency-free tar for shipping the project and reading back changes
 src/sandbox.js    environment detection, self-relaunch under the permission model, OS sandbox for commands
 src/confine.js    confined test runs (Node permission model) with the must-fail canary
 src/evolve.js     sandbox, guardian, protected files, apply, backup and rollback
