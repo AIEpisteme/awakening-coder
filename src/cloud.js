@@ -57,6 +57,12 @@ export async function packProject(root) {
   return { tar: createTar(entries), files: entries.length, bytes, redacted, binary: skippedBinary };
 }
 
+/** Cheap probe: can this key + workspace use Managed Agents? Returns { ok, error }. */
+export async function checkCloudAccess(client) {
+  try { await client.beta.environments.list({ limit: 1 }); return { ok: true }; }
+  catch (error) { return { ok: false, error }; }
+}
+
 /** Find or create the agent and environment, cached in awareness state by configuration. */
 export async function ensureCloudResources(client, { model, net, state }) {
   const tools = [{ type: 'agent_toolset_20260401', default_config: { permission_policy: { type: 'always_allow' } }, configs: [{ name: 'web_fetch', enabled: false }, { name: 'web_search', enabled: false }] }];

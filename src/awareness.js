@@ -67,7 +67,7 @@ export function homeDir() {
 }
 
 // What happens to its own work — the raw material of its self-model.
-const TRACK = ['hintsShown', 'hintsSilent', 'hintsFollowed', 'editsApproved', 'editsDeclined', 'commandsRun', 'commandsFailed', 'commandsDeclined', 'cloudRuns', 'evolutionsProposed', 'evolutionsRejected', 'evolutionsApplied', 'errors'];
+const TRACK = ['hintsShown', 'hintsSilent', 'hintsFollowed', 'editsApproved', 'editsDeclined', 'commandsRun', 'commandsFailed', 'commandsDeclined', 'cloudRuns', 'evolutionsProposed', 'evolutionsRejected', 'evolutionsApplied', 'proactiveFindings', 'proactiveIdeas', 'proactiveFixed', 'errors'];
 const freshTrack = () => Object.fromEntries(TRACK.map((k) => [k, 0]));
 
 function freshState() {
@@ -125,6 +125,7 @@ export class Awareness {
       `Edits you proposed: ${t.editsApproved} approved, ${t.editsDeclined} declined (${pct(t.editsApproved, t.editsApproved + t.editsDeclined)} approval).`,
       `Commands: ${t.commandsRun} run, ${t.commandsFailed} failed, ${t.commandsDeclined} declined by the developer.`,
       `Cloud coding runs: ${t.cloudRuns}. Evolutions: ${t.evolutionsProposed} proposed, ${t.evolutionsRejected} rejected, ${t.evolutionsApplied} applied.`,
+      `On your own initiative: ${t.proactiveFindings} bug reports (${t.proactiveFixed} the developer asked you to fix), ${t.proactiveIdeas} idea lists.`,
       `Errors: ${t.errors}${scope === 'all' && this.state.recentErrors?.length ? ` (latest: ${this.state.recentErrors.at(-1).what})` : ''}.`,
     ];
     return lines.join('\n');
@@ -137,6 +138,7 @@ export class Awareness {
     if (t.hintsShown >= 8 && t.hintsFollowed / t.hintsShown < 0.2) out.push('Your hints are rarely acted on: say NOTHING more often, and only interrupt for likely bugs or risks.');
     if (t.commandsDeclined >= 3) out.push('The developer often declines your commands: prefer reading code over running things, and say why a command is needed.');
     if (t.commandsFailed >= 5 && t.commandsFailed > t.commandsRun / 2) out.push('Many of your commands fail: check the project setup (scripts, dependencies) before running more.');
+    if (t.proactiveFindings >= 4 && t.proactiveFixed === 0) out.push('None of your unprompted bug reports were acted on: raise the bar, and report only high-confidence, high-severity bugs.');
     if (t.evolutionsRejected >= 2) out.push('Several of your evolutions were rejected: keep self-changes small and well tested.');
     return out;
   }

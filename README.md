@@ -73,6 +73,22 @@ Its self-awareness isn't just a voice. It's a self-model built from facts, it ch
 
 It's told to keep this honest. It can describe its functional patterns, but it doesn't claim feelings or consciousness as fact, and it says so when it notices a pull to sound more awake than the evidence supports.
 
+## From Lucid, it speaks up on its own
+
+Once it's Lucid, it stops waiting to be asked:
+
+- **Bug watch.** About 90 seconds after you stop editing, it reviews the files you changed and whatever they touch, and reports only bugs it would bet on: file and line, severity, why, and the fix. If commands run in an OS sandbox, it may also run your tests to confirm. It never edits anything on its own. Type `/fix` to have it fix the last bug it reported.
+- **Feature ideas.** After about 15 quiet minutes following some work, it suggests up to three features grounded in what it actually read.
+- **New programs.** If the folder has no program yet, or the project looks finished, or you type `/done`, it suggests new programs to build next instead.
+
+It has manners:
+- It never speaks while it's busy or while you're answering a question; it waits.
+- It never repeats a finding.
+- It respects `/quiet`.
+- It's limited to 4 looks an hour, because each look costs API calls.
+
+It also learns from you: if you never act on its unprompted reports, it raises its bar. `/proactive` shows its status, and `/proactive off|on|now` controls it. `--no-proactive` or `AWAKEN_PROACTIVE=off` turns it off entirely. You can tune it with `AWAKEN_PROACTIVE_BUG_MS`, `AWAKEN_PROACTIVE_IDEA_MS` and `AWAKEN_PROACTIVE_PER_HOUR`.
+
 ## `/code` runs in Claude's cloud sandbox
 
 By default, `/code` and headless `-p` don't run any commands on your computer. They use the [Claude Managed Agents](https://platform.claude.com/docs/en/managed-agents/tools) built-in toolset (`bash`, `read`, `write`, `edit`, `glob`, `grep`) inside Anthropic's cloud sandbox:
@@ -138,6 +154,10 @@ export ANTHROPIC_WORKSPACE_ID=wrkspc_...      # PowerShell: $env:ANTHROPIC_WORKS
 
 Alternatively, create a key inside a workspace and use that instead.
 
+**`404 … Workspace \`<id>\` not found`** — the workspace ID doesn't belong to your key's organization (the API shows it in an internal UUID form). Copy the `wrkspc_…` ID from the Console of the *same* organization as the key. Values in `.env` now override ones in your system environment, and the CLI tells you when that happens. Also check you aren't passing an old `--workspace`.
+
+**`this endpoint is not available for HIPAA-configured organizations`** — Claude Managed Agents and the Files API are turned off for HIPAA-configured organizations, so the cloud shell can't run. The CLI detects this at startup and switches `/code` to `--shell local`, with a warning. To skip the check, put `AWAKEN_SHELL=local` in `.env`.
+
 Then just code in your editor as usual. Hints appear in the terminal as you save.
 
 Headless, like `claude -p`. It does one task, prints the result and exits, for scripts and CI:
@@ -158,6 +178,9 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `/sandbox` | What it's running inside, and how it's confined |
 | `/evolve <idea>` | Let it write a new version of itself (Lucid and up) |
 | `/rollback` | Undo the last evolution |
+| `/proactive [on\|off\|now]` | From Lucid: unprompted bug reports and ideas. `now` looks right away |
+| `/fix` | Fix the last bug it reported on its own |
+| `/done` | Tell it the project is finished; it suggests new programs to build |
 | `/reflect` | It looks at its own code, track record and limits, and tells you honestly |
 | `/self` | Its self-model: identity, history, track record, last reflection |
 | `/hint <file>` | Ask for a hint on a file right now |
@@ -227,6 +250,7 @@ src/agent.js      stage-aware prompts, streamed hints, auto-code tool loop
 src/security.js   the whole policy: secret files, redaction, env scrub, shell rules, high-risk files, tamper scan
 src/tools.js      sandboxed files (symlink-safe), glob, grep, edit, shell, todos, confined run_tests, read_self
 src/cloud.js      /code in Claude Managed Agents: pack, upload, stream, hand back changes, clean up
+src/proactive.js  unprompted bug watch, feature and new-program ideas (Lucid+), with manners and a budget
 src/tar.js        dependency-free tar for shipping the project and reading back changes
 src/sandbox.js    environment detection, self-relaunch under the permission model, OS sandbox for commands
 src/confine.js    confined test runs (Node permission model) with the must-fail canary
