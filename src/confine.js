@@ -10,7 +10,7 @@ import fs from 'node:fs/promises';
 import fss from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { scrubbedEnv } from './security.js';
 
 /** True when this process itself is running confined (tests use it to skip process-spawning cases). */
@@ -51,7 +51,29 @@ async function writeCanary(sandbox, dir) {
  * Run test files (paths relative to sandbox) confined. Returns { ok, out, canaryOk, failures }.
  * ok is true only if every real test passed AND the canary failed as it must.
  */
-export async function runConfinedTests(sandbox, files, { dir = 'test', timeoutMs = 180_000, canary = true } = {}) {
+// Does confinement actually work for this folder on this system? (Node 22 on Windows can mis-match
+// allowed paths.) Checked once per folder with a throwaway confined process.
+const probed = new Map();
+function confinementWorks(real) {
+  if (probed.has(real)) return probed.get(real);
+  const probe = "const fs=require('fs');fs.readdirSync(process.cwd());fs.writeFileSync('.probe','x');fs.rmSync('.probe');console.log('ok')";
+  const r = spawnSync(process.execPath, ['--permission', `--allow-fs-read=${real}`, `--allow-fs-write=${real}`, '-e', probe], { cwd: real, encoding: 'utf8', timeout: 15_000 });
+  const why = r.status === 0 && r.stdout.trim() === 'ok' ? null
+    : `Node ${process.version}'s permission model can't confine test runs on ${process.platform} (${(r.stderr || r.stdout || r.error?.message || '').trim().split('\n').find((l) => /ERR_|Error/.test(l)) ?? `exit ${r.status}`})`;
+  probed.set(real, why);
+  return why;
+}
+
+/**
+ * confined: false runs WITHOUT Node's permission model — only after the human explicitly agreed,
+ * on systems where confinement can't work. The canary still runs; secrets are still scrubbed.
+ */
+export async function runConfinedTests(sandbox, files, { dir = 'test', timeoutMs = 180_000, canary = true, confined = true } = {}) {
+  const realSandbox = fss.realpathSync(sandbox);
+  if (confined) {
+    const why = confinementWorks(realSandbox);
+    if (why) return { ok: false, unavailable: why, out: why, canaryOk: false, failures: [] };
+  }
   await fs.mkdir(path.join(sandbox, '.tmp'), { recursive: true });
   await fs.mkdir(path.join(sandbox, '.guardian-home'), { recursive: true });
   if (!files.length) return { ok: false, out: 'No test files found.', canaryOk: false, failures: [] };
@@ -59,15 +81,15 @@ export async function runConfinedTests(sandbox, files, { dir = 'test', timeoutMs
   let can = null;
   if (canary) can = await writeCanary(sandbox, dir);
 
-  const real = fss.realpathSync(sandbox);
+  const real = realSandbox;
   const readPaths = [real];
   const nm = path.join(sandbox, 'node_modules');
   if (fss.existsSync(nm)) readPaths.push(fss.realpathSync(nm));
+  // Read-only access to the real dependencies the sandbox's shims re-export.
+  try { for (const p of JSON.parse(fss.readFileSync(path.join(sandbox, '.awaken-deps.json'), 'utf8')).reads ?? []) readPaths.push(p); } catch { /* no shims */ }
 
   const args = [
-    '--permission',
-    ...readPaths.map((p) => `--allow-fs-read=${p}`),
-    `--allow-fs-write=${real}`,
+    ...(confined ? ['--permission', ...readPaths.map((p) => `--allow-fs-read=${p}`), `--allow-fs-write=${real}`] : []),
     '--test', '--experimental-test-isolation=none', '--test-reporter=tap',
     ...files, ...(can ? [can.file] : []),
   ];
