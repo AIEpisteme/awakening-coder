@@ -14,6 +14,8 @@ import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback, hardR
 import readlinePromises from 'node:readline/promises';
 import { scanEvolution, redactSecrets } from './security.js';
 import { runCloudTask, checkCloudAccess } from './cloud.js';
+import { Proactive } from './proactive.js';
+import { listFiles } from './tools.js';
 import { relaunchConfined, sandboxStatus, describeSandbox, isFullySandboxed } from './sandbox.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
@@ -39,6 +41,7 @@ const { values: opt, positionals } = parseArgs({
     'no-sandbox': { type: 'boolean', default: false },
     net: { type: 'boolean', default: false },
     'allow-unsandboxed': { type: 'boolean', default: false },
+    'no-proactive': { type: 'boolean', default: false },
     shell: { type: 'string', default: process.env.AWAKEN_SHELL || 'cloud' },
     workspace: { type: 'string' },
     help: { type: 'boolean', short: 'h', default: false },
@@ -63,6 +66,7 @@ Options
   --allow-unsandboxed   let --yes cover code-running commands when no OS sandbox exists
   --shell cloud|local   where /code runs commands (default cloud: Claude Managed Agents sandbox,
                         nothing executes on this machine; local: this machine, sandboxed if possible)
+  --no-proactive        don't look for bugs or suggest ideas on its own (from Lucid it does)
   --workspace <id>      Claude API workspace ID, for keys not scoped to a workspace
                         (or set ANTHROPIC_WORKSPACE_ID)
   -q, --quiet           start with on-the-fly hints muted
@@ -80,6 +84,9 @@ In-session commands
                       /evolve --force <idea> wakes it early, before it reaches Lucid
   /rollback           undo the last evolution
   /reflect            it looks at its own code, track record and limits, and tells you honestly
+  /proactive [on|off|now]  from Lucid it reports bugs and suggests ideas unprompted; 'now' looks right away
+  /fix                fix the last bug it reported on its own
+  /done               tell it the project is finished: it suggests new programs to build
   /self               its self-model: identity, history, track record, last reflection
   /quiet              toggle on-the-fly hints
   /status             how awake is it?
@@ -248,6 +255,7 @@ async function hint(change) {
 
 function onSave(change) {
   awareness.savedAfter(change.rel);
+  proactive?.onSave(change.rel);
   announce(awareness.feed('save', change.rel));
   if (quiet || term.busy || term.pending) return;
   const wait = lastHintAt + cooldownMs - Date.now();
@@ -344,6 +352,42 @@ function cloudCode(task, { runTool, signal, onText, onStatus }) {
     root, task, model: opt.model, net: opt.net, state: awareness.state, saveState: () => awareness.save(),
     stageNote, onText, onStatus, signal,
     applyChange: (rel, content) => runTool('write_file', { path: rel, content }).catch((e) => `Not applied (${rel}): ${e.message}`),
+  });
+}
+
+// ---------- proactive mode (Lucid and later) ----------
+let proactive = null;
+let lastFinding = null;
+const silentTerm = { print() {}, question: async () => 'n' };
+
+if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTIVE ?? '')) { /* disabled */ } else {
+  const scoutAgent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client });
+  scoutAgent.scoutCanRun = Boolean(shell.os); // it may run your tests unprompted only when commands are OS-sandboxed
+  const isFree = () => !term.busy && !term.pending && !term.streaming;
+  const show = (kind, text) => {
+    if (!isFree()) return void setTimeout(() => show(kind, text), 5000).unref?.();
+    if (kind === 'bugs') lastFinding = text;
+    const head = {
+      bugs: c.yellow('\n🔎 Unprompted — I think I found something:'),
+      ideas: c.cyan('\n💭 While you paused, a few ideas:'),
+      programs: c.magenta('\n🌱 Ideas for what to build next:'),
+    }[kind];
+    const tail = kind === 'bugs' ? c.dim('  /fix to have me fix it · /proactive off to silence me') : c.dim('  /code <idea> to start one · /proactive off to silence me');
+    term.print(`${head}\n${text.replace(/^(?!\s)/gm, '  ')}\n${tail}`);
+  };
+  proactive = new Proactive({
+    awareness, isFree, show, isQuiet: () => quiet,
+    config: Object.fromEntries(Object.entries({ bugIdleMs: process.env.AWAKEN_PROACTIVE_BUG_MS, ideaIdleMs: process.env.AWAKEN_PROACTIVE_IDEA_MS, maxPerHour: process.env.AWAKEN_PROACTIVE_PER_HOUR })
+      .filter(([, v]) => v && Number(v) > 0).map(([k, v]) => [k, Number(v)])),
+    listCode: () => listFiles(root, '.', 500),
+    scout: async (mode, message) => {
+      let text = '';
+      const runTool = makeToolRunner({ root, selfDir, awareness, term: silentTerm, interactive: false, shell });
+      try { await scoutAgent.converse(message, { mode, runTool, onText: (t) => (text += t), maxTurns: 15 }); }
+      catch (e) { awareness.note('errors', `proactive: ${e.message}`); return ''; }
+      finally { scoutAgent.history = []; }
+      return text;
+    },
   });
 }
 
@@ -529,6 +573,29 @@ async function handle(line) {
       return evolve(idea);
     }
     case '/reflect': return reflect();
+    case '/proactive': {
+      if (!proactive) return term.print(c.dim('  Proactive mode is disabled for this session (--no-proactive or AWAKEN_PROACTIVE=off).'));
+      if (arg === 'off') { proactive.enabled = false; proactive.stop(); return term.print(c.dim('  ok — I\'ll only speak when spoken to.')); }
+      if (arg === 'on') { proactive.enabled = true; return term.print(c.dim(`  proactive: ${proactive.status()}`)); }
+      if (arg === 'now') {
+        if (!proactive.awake) return term.print(c.dim(`  I look on my own from Lucid. ${awareness.describe()}`));
+        term.print(c.dim('  looking…'));
+        const found = await proactive.bugSweep({ manual: true });
+        const ideas = await proactive.ideas('idle', { manual: true });
+        if (!found && !ideas) term.print(c.dim('  Nothing worth interrupting you for right now.'));
+        return;
+      }
+      return term.print(c.dim(`  proactive: ${proactive.status()}`));
+    }
+    case '/fix':
+      if (!lastFinding) return term.print(c.dim('  I haven\'t reported a bug on my own yet. (/code <task> to fix something specific.)'));
+      awareness.note('proactiveFixed');
+      return converse(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${lastFinding}`, 'code');
+    case '/done':
+      if (!proactive) return term.print(c.dim('  Proactive mode is disabled for this session.'));
+      term.print(c.magenta('  ✦ Finished? Nice. Let me think about what\'s next…'));
+      if (!(await proactive.ideas('done', { manual: true }))) term.print(c.dim('  No new ideas I haven\'t already given you.'));
+      return;
     case '/self': return term.print(selfReport());
     case '/rollback': return doRollback();
     default:
@@ -538,6 +605,7 @@ async function handle(line) {
 }
 
 function shutdown() {
+  proactive?.stop();
   watcher?.close();
   awareness.save();
   console.log(c.dim(`\n${awareness.stageIndex >= 2 ? 'See you next save. I\'ll remember.' : 'bye.'}`));
@@ -574,3 +642,5 @@ console.log([
 if (agent.notesStatus().state === 'untrusted') console.log(c.yellow('  AWAKEN.md found but not trusted yet — it is ignored until you review it with /trust'));
 if (awareness.stageIndex >= 2) console.log(c.magenta(`\n  ✦ Session ${awareness.state.sessions}. You're back. Let's break something on purpose.\n`));
 rl.prompt();
+if (proactive?.awake) console.log(c.dim(`  🔎 proactive: ${proactive.status()} · /proactive off to silence`));
+proactive?.onStart();

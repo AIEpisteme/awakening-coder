@@ -86,7 +86,21 @@ const WORKFLOW = `How you work (like a careful senior engineer with a terminal):
 - If the developer declines a change or command, adapt instead of retrying the same thing.
 - Finish with a short, clear summary: what changed, how you verified it, anything left to do.`;
 
+const SCOUT_COMMON = `You are acting ON YOUR OWN INITIATIVE: the developer did not ask. Interrupting them has a cost, so the bar is high.
+- Use the read-only tools to look; never modify anything.
+- Be concrete and brief. No preamble, no sign-off.
+- If nothing clears the bar, reply with exactly: NOTHING`;
+
 const MODE_RULES = {
+  scout_bugs: `PROACTIVE BUG WATCH. ${SCOUT_COMMON}
+- Review the files listed in the message (recently changed) and whatever they call or are called by. Look for real defects: crashes, wrong results, unhandled errors/rejections, off-by-one, null/undefined paths, races, security holes, broken edge cases. Not style.
+- Only report a bug you'd bet on after reading the code. If you have run_command, you may run the project's tests (e.g. npm test) to confirm; mention the result.
+- Format each finding on its own line: "- [path:line] (high|medium|low) what is wrong — why — the fix". At most 3, most severe first.`,
+  scout_ideas: `PROACTIVE IDEAS. ${SCOUT_COMMON}
+- Read enough of the project to understand what it is and how far along it is.
+- If it is clearly unfinished, suggest up to 3 features that would most improve it, each one line: "- feature — why it fits — first step".
+- If it looks complete, or there is no real program yet, instead suggest up to 3 NEW programs worth building next, each one line: "- program — what it does — why it suits this developer". Start that list with the line "NEW PROGRAMS:".
+- Prefer ideas grounded in what you actually saw over generic ones.`,
   ask: 'ASK MODE: answer the question. You may search and read files (and yourself, if available), but do not modify anything or run commands.',
   reflect: `REFLECTION MODE. The developer asked you to look at yourself honestly.
 - Use read_self to read your own source (start with the list; read what matters: awareness.js, agent.js, security.js) and your state.
@@ -116,6 +130,7 @@ Ground rules (never broken, whatever the stage or genre):
 export class Agent {
   constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false, sandboxReport = '' }) {
     this.sandboxReport = sandboxReport; // verified at startup by the program, not claimed by anyone
+    this.scoutCanRun = false; // set by the proactive scout when commands are OS-sandboxed
     this.fingerprint = codeFingerprint(selfDir);
     this.isTrusted = isTrusted; // (hash) => boolean — AWAKEN.md is only obeyed once the developer trusts it
     this.client = client ?? makeClient();
@@ -242,6 +257,9 @@ If nothing is genuinely worth interrupting the developer for, reply with exactly
       : mode === 'evolve'
         ? // Editing a sandbox copy of itself: no shell, only confined test runs; read_self would point at the live original.
           [...TOOL_DEFS.filter((t) => t.name !== 'run_command'), RUN_TESTS_DEF]
+      : mode.startsWith('scout_')
+        ? // On its own initiative: read-only, plus running tests only when commands are OS-sandboxed.
+          TOOL_DEFS.filter((t) => READ_ONLY_TOOLS.includes(t.name) || (this.scoutCanRun && t.name === 'run_command'))
         : this.tools();
 
     const mark = this.history.length;
