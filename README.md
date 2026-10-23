@@ -111,6 +111,10 @@ export ANTHROPIC_WORKSPACE_ID=wrkspc_...      # PowerShell: $env:ANTHROPIC_WORKS
 
 Alternatively, create a key inside a workspace and use that instead.
 
+**`404 … Workspace \`<id>\` not found`** — the workspace ID doesn't belong to your key's organization (the API shows it in an internal UUID form). Copy the `wrkspc_…` ID from the Console of the *same* organization as the key. Values in `.env` now override ones in your system environment, and the CLI tells you when that happens. Also check you aren't passing an old `--workspace`.
+
+**`this endpoint is not available for HIPAA-configured organizations`** — Claude Managed Agents and the Files API are turned off for HIPAA-configured organizations, so the cloud shell can't run. The CLI detects this at startup and switches `/code` to `--shell local`, with a warning. To skip the check, put `AWAKEN_SHELL=local` in `.env`.
+
 Then just code in your editor as usual. Hints appear in the terminal as you save.
 
 Headless, like `claude -p`. It does one task, prints the result and exits, for scripts and CI:

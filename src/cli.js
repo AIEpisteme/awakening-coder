@@ -7,19 +7,22 @@ import readline from 'node:readline';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { Awareness, GENRES, STAGES, homeDir } from './awareness.js';
-import { Agent, notesHash, makeClient, explainApiError } from './agent.js';
+import { Agent, notesHash, makeClient, explainApiError, loadDotEnv, isCloudUnavailable } from './agent.js';
 import { startWatcher } from './watcher.js';
 import { makeToolRunner, resolveInside, runShell } from './tools.js';
 import { prepareSandbox, runGuardian, diffTrees, applyEvolution, rollback, hardRejections } from './evolve.js';
 import { scanEvolution, redactSecrets } from './security.js';
-import { runCloudTask } from './cloud.js';
+import { runCloudTask, checkCloudAccess } from './cloud.js';
 import { relaunchConfined, sandboxStatus, describeSandbox, isFullySandboxed } from './sandbox.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
 const selfRoot = path.join(selfDir, '..');
-try { process.loadEnvFile(path.join(selfRoot, '.env')); } catch { /* optional */ }
+// .env wins over inherited variables, so editing it always takes effect (see loadDotEnv).
+const shellFromEnvBefore = process.env.AWAKEN_SHELL;
+const dotEnv = loadDotEnv(path.join(selfRoot, '.env'));
+if (dotEnv.overridden.length) console.error(c.dim(`  .env overrides ${dotEnv.overridden.join(', ')} from your system environment`));
 
 const { values: opt, positionals } = parseArgs({
   allowPositionals: true,
@@ -112,7 +115,26 @@ if (!opt['no-sandbox'] && relaunchConfined({ root, selfRoot, stateDir: homeDir()
 const sandbox = sandboxStatus({ allowNet: opt.net, disabled: opt['no-sandbox'] });
 const shell = { os: sandbox.os, allowNet: opt.net, allowUnsandboxed: opt['allow-unsandboxed'] };
 if (!['cloud', 'local'].includes(opt.shell)) { console.error(c.red(`--shell must be "cloud" or "local", not "${opt.shell}"`)); process.exit(1); }
-const cloudShell = opt.shell === 'cloud';
+const client = makeClient({ workspaceId: opt.workspace ?? process.env.ANTHROPIC_WORKSPACE_ID });
+// Check up front that this key can use Managed Agents, rather than failing on the first /code.
+// If the organization can't (e.g. HIPAA-configured) and cloud wasn't asked for explicitly, run locally.
+let cloudShell = opt.shell === 'cloud';
+if (cloudShell) {
+  const shellExplicit = process.argv.some((a) => a === '--shell' || a.startsWith('--shell=')) || !!(shellFromEnvBefore || process.env.AWAKEN_SHELL);
+  const probe = await checkCloudAccess(client);
+  if (!probe.ok) {
+    const fix = explainApiError(probe.error);
+    if (isCloudUnavailable(probe.error) && !shellExplicit) {
+      cloudShell = false;
+      console.error(c.yellow('Cloud shell unavailable for this API key, so /code will run on this machine (--shell local).'));
+      if (fix) console.error(c.dim('  ' + fix.split('\n')[0]));
+    } else {
+      console.error(c.red(`Can't use the cloud shell: ${probe.error?.message ?? probe.error}`));
+      if (fix) console.error(c.yellow(fix));
+      process.exit(1);
+    }
+  }
+}
 const sandboxReport = describeSandbox(sandbox) + (cloudShell
   ? `\nCoding tasks (/code, -p): run in Claude Managed Agents' cloud sandbox — a copy of the project is uploaded (secret files skipped, inline secrets redacted), commands run there and never on this machine, and changed files come back for the developer's approval.`
   : '\nCoding tasks (/code, -p): run on this machine (--shell local).');
@@ -121,7 +143,6 @@ const awareness = new Awareness();
 if (opt.forget) awareness.forget();
 let headlessTrust = null;
 const isTrusted = (hash) => awareness.notesTrusted(root, hash) || (headlessTrust !== null && headlessTrust === hash);
-const client = makeClient({ workspaceId: opt.workspace ?? process.env.ANTHROPIC_WORKSPACE_ID });
 const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client });
 
 // ======================================================================

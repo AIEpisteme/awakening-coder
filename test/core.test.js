@@ -7,7 +7,7 @@ import path from 'node:path';
 import { unifiedDiff, changedLineCount } from '../src/diff.js';
 import { resolveInside, makeToolRunner } from '../src/tools.js';
 import { Awareness } from '../src/awareness.js';
-import { Agent, makeClient, explainApiError } from '../src/agent.js';
+import { Agent, makeClient, explainApiError, loadDotEnv, isCloudUnavailable } from '../src/agent.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'awaken-'));
 
@@ -153,4 +153,23 @@ test('the unscoped-key error gets a clear fix', () => {
   assert.match(fix, /ANTHROPIC_WORKSPACE_ID/);
   assert.match(fix, /--workspace/);
   assert.equal(explainApiError(new Error('500 overloaded')), null);
+});
+
+test('.env values win over stale inherited ones (the "Workspace not found" cause)', () => {
+  const file = path.join(tmp(), '.env');
+  fs.writeFileSync(file, 'ANTHROPIC_WORKSPACE_ID="wrkspc_new"\nAWAKEN_MODEL=m\n');
+  const env = { ANTHROPIC_WORKSPACE_ID: 'wrkspc_old_from_system', AWAKEN_MODEL: 'm' };
+  const r = loadDotEnv(file, env);
+  assert.equal(env.ANTHROPIC_WORKSPACE_ID, 'wrkspc_new');
+  assert.deepEqual(r.overridden, ['ANTHROPIC_WORKSPACE_ID']); // names only, unchanged values not reported
+  assert.deepEqual(loadDotEnv(path.join(tmp(), 'missing'), {}), { loaded: false, overridden: [] });
+});
+
+test('workspace-not-found and HIPAA errors get clear fixes', () => {
+  const nf = new Error('404 {"type":"error","error":{"type":"not_found_error","message":"Workspace `d69671fc-d146-498d-8613-fc9915ce30a0` not found."}}');
+  assert.match(explainApiError(nf), /ANTHROPIC_WORKSPACE_ID/);
+  assert.equal(isCloudUnavailable(nf), false);
+  const hipaa = Object.assign(new Error('400 {"error":{"message":"this endpoint is not available for HIPAA-configured organizations: contact support"}}'), { status: 400 });
+  assert.match(explainApiError(hipaa), /--shell local/);
+  assert.equal(isCloudUnavailable(hipaa), true);
 });

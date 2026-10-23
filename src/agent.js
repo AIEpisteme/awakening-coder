@@ -6,6 +6,7 @@ import path from 'node:path';
 import { TOOL_DEFS, READ_SELF_DEF, READ_ONLY_TOOLS, RUN_TESTS_DEF } from './tools.js';
 import { redactSecrets } from './security.js';
 import { createHash } from 'node:crypto';
+import { parseEnv } from 'node:util';
 
 /**
  * Claude API client. Keys that aren't scoped to a workspace must name one on every request
@@ -16,9 +17,45 @@ export function makeClient({ workspaceId = process.env.ANTHROPIC_WORKSPACE_ID } 
   return new Anthropic(id ? { defaultHeaders: { 'anthropic-workspace-id': id } } : {});
 }
 
+/**
+ * Load the .env next to package.json. Unlike process.loadEnvFile, its values WIN over ones
+ * already in the environment, so editing .env always takes effect — an old
+ * ANTHROPIC_WORKSPACE_ID left in the system environment used to override it silently and cause
+ * "Workspace `…` not found". Returns the names (never values) of variables it replaced.
+ */
+export function loadDotEnv(file, env = process.env) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return { loaded: false, overridden: [] }; }
+  const overridden = [];
+  for (const [k, v] of Object.entries(parseEnv(text))) {
+    if (env[k] !== undefined && env[k] !== v) overridden.push(k);
+    env[k] = v;
+  }
+  return { loaded: true, overridden };
+}
+
+/** True when the error means this organization can't use Managed Agents / Files (the cloud shell). */
+export function isCloudUnavailable(err) {
+  const msg = String(err?.message ?? err);
+  return /HIPAA-configured|endpoint is not available for/i.test(msg) || (err?.status === 403 && /permission_error/i.test(msg));
+}
+
 /** Turn API errors that need the developer's action into a clear next step. */
 export function explainApiError(err) {
   const msg = String(err?.message ?? err);
+  if (/HIPAA-configured/i.test(msg)) {
+    return 'This API organization is HIPAA-configured, so Claude Managed Agents and the Files API (used by the cloud shell) are turned off for it.\n' +
+      '  Fix: run /code on this machine with --shell local (or put AWAKEN_SHELL=local in .env).\n' +
+      '  Or: use an API key from an organization without HIPAA configuration.';
+  }
+  if (/endpoint is not available for/i.test(msg)) {
+    return 'This API organization can\'t use the endpoints the cloud shell needs. Use --shell local (or AWAKEN_SHELL=local in .env).';
+  }
+  if (/workspace\b.*\bnot found/i.test(msg)) {
+    return 'The API can\'t find that workspace for this key (the ID in the error is the internal form of the one you sent).\n' +
+      '  Fix: copy the workspace ID (wrkspc_…) from the Claude Console, in the SAME organization as your API key, into ANTHROPIC_WORKSPACE_ID in .env.\n' +
+      '  Also check that you didn\'t pass an old --workspace, and remove any old ANTHROPIC_WORKSPACE_ID from your system environment.';
+  }
   if (/anthropic-workspace-id|not scoped to a workspace/i.test(msg)) {
     return 'Your API key is not scoped to a workspace, so each request must name one.\n' +
       '  Fix: set ANTHROPIC_WORKSPACE_ID (environment or .env next to package.json), or pass --workspace <id>.\n' +
