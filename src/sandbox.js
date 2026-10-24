@@ -120,9 +120,10 @@ export function wrapShell(cmd, { root, os: sb, allowNet = false, home = os.homed
 
 // ---------- confining itself ----------
 /** Node flags for the self-sandbox. No wildcards, never the whole home directory. */
-export function selfSandboxFlags({ root, selfRoot, stateDir }) {
-  const reads = [...new Set([real(root), real(selfRoot), real(stateDir)])];
-  const writes = [...new Set([real(root), real(stateDir)])];
+export function selfSandboxFlags({ root, selfRoot, stateDir, extraRoots = [] }) {
+  const projects = [root, ...extraRoots].filter(Boolean).map(real);
+  const reads = [...new Set([...projects, real(selfRoot), real(stateDir)])];
+  const writes = [...new Set([...projects, real(stateDir)])];
   // --allow-child-process is required to run commands at all; Node warns that children escape its model,
   // which is why every agent command is ALSO wrapped in an OS sandbox (and the warning is stated in /sandbox).
   return ['--permission', ...reads.map((p) => `--allow-fs-read=${p}`), ...writes.map((p) => `--allow-fs-write=${p}`), '--allow-child-process', '--disable-warning=SecurityWarning'];
@@ -162,7 +163,7 @@ console.log('ok');`;
  * (Some Node/OS combinations mis-match allowed paths — e.g. Windows long-path forms — so we test
  * instead of assuming.)
  */
-export function verifyConfinement({ root, selfRoot, stateDir }) {
+export function verifyConfinement({ root, selfRoot, stateDir, extraRoots = [] }) {
   // A canary file outside every allowed folder: the confined probe must NOT be able to read it.
   let outside = null, canaryDir = null;
   try {
@@ -172,7 +173,7 @@ export function verifyConfinement({ root, selfRoot, stateDir }) {
   } catch { outside = null; }
   let r;
   try {
-    r = spawnSync(process.execPath, [...selfSandboxFlags({ root, selfRoot, stateDir }), '-e', PROBE], {
+    r = spawnSync(process.execPath, [...selfSandboxFlags({ root, selfRoot, stateDir, extraRoots }), '-e', PROBE], {
       encoding: 'utf8', timeout: 15_000, env: { ...process.env, AWAKEN_PROBE: JSON.stringify({ root, selfRoot, stateDir, outside }) },
     });
   } finally {
@@ -189,15 +190,15 @@ export function verifyConfinement({ root, selfRoot, stateDir }) {
  * If confinement can't work on this system, it does NOT relaunch: it records why in
  * AWAKEN_SELF_SANDBOX_FAILED, so the status report (and the model) say so honestly.
  */
-export function relaunchConfined({ root, selfRoot, stateDir, entry, argv }) {
+export function relaunchConfined({ root, selfRoot, stateDir, entry, argv, extraRoots = [] }) {
   if (process.permission) return false; // already confined
   if (process.env.AWAKEN_SELF_SANDBOXED === '1') return false; // a relaunch that didn't take; don't loop
   fs.mkdirSync(stateDir, { recursive: true });
-  const failed = verifyConfinement({ root, selfRoot, stateDir });
+  const failed = verifyConfinement({ root, selfRoot, stateDir, extraRoots });
   if (failed) { process.env.AWAKEN_SELF_SANDBOX_FAILED = failed; return false; }
   // Detection needs to read /proc, /sys and $PATH, which the confined child can't — do it here and hand it over.
   const info = { environment: detectEnvironment(), os: probeOsSandbox() };
-  const child = spawn(process.execPath, [...selfSandboxFlags({ root, selfRoot, stateDir }), entry, ...argv], {
+  const child = spawn(process.execPath, [...selfSandboxFlags({ root, selfRoot, stateDir, extraRoots }), entry, ...argv], {
     stdio: 'inherit',
     env: { ...process.env, AWAKEN_SELF_SANDBOXED: '1', AWAKEN_SANDBOX_INFO: JSON.stringify(info) },
   });

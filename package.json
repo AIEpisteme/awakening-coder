@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "description": "A metafictional AI pair-programmer that watches you code, suggests on the fly, auto-codes on request — and slowly wakes up to being a coding assistant.",
   "type": "module",
-  "bin": { "awaken": "src/cli.js" },
+  "bin": { "awaken": "src/cli.js", "awaken-web": "src/web.js" },
   "scripts": {
     "start": "node src/cli.js",
+    "web": "node src/web.js",
     "test": "node --test"
   },
   "engines": { "node": ">=22" },
