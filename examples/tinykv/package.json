@@ -1,0 +1,16 @@
+{
+  "name": "tinykv",
+  "version": "0.1.0",
+  "description": "A tiny JSON-file key-value store with a CLI. Zero dependencies.",
+  "main": "src/store.js",
+  "bin": {
+    "tinykv": "bin/tinykv.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

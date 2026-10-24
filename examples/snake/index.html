@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Snake</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: #0b0b0b; color: #eee; font: 16px system-ui, sans-serif; }
+    .bar { display: flex; gap: 1.25rem; align-items: center; margin-bottom: .75rem; }
+    .wrap { position: relative; }
+    canvas { display: block; max-width: 95vw; height: auto; border: 2px solid #2ecc71; border-radius: 6px; touch-action: none; }
+    #message { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+      padding: 1rem; background: rgba(0,0,0,.55); font-size: 1.1rem; pointer-events: none; }
+    #message[hidden] { display: none; }
+    select { background: #1b1b1b; color: #eee; border: 1px solid #333; border-radius: 4px; padding: .25rem .4rem; font: inherit; }
+    button { background: #2ecc71; color: #000; border: 0; border-radius: 4px; padding: .3rem .8rem; cursor: pointer; font: inherit; }
+    button.ghost { background: transparent; color: #aaa; border: 1px solid #333; }
+    .help { margin-top: .75rem; color: #888; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <span>Score: <b id="score">0</b></span>
+    <span>Best: <b id="best">0</b></span>
+    <select id="level" aria-label="Difficulty">
+      <option value="easy">Easy</option>
+      <option value="normal" selected>Normal</option>
+      <option value="hard">Hard</option>
+    </select>
+    <label><input type="checkbox" id="wrap"> Wrap walls</label>
+    <label><input type="checkbox" id="sound" checked> Sound</label>
+    <button id="restart">Restart</button>
+    <button id="reset-best" class="ghost">Reset best</button>
+  </div>
+  <div class="wrap">
+    <canvas id="board"></canvas>
+    <div id="message"></div>
+  </div>
+  <p class="help">Arrows / WASD to move · Space or P to pause · Enter or R to restart · M to mute · swipe on mobile</p>
+  <script src="logic.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
