@@ -85,7 +85,10 @@ In-session commands
   /rollback           undo the last evolution
   /reflect            it looks at its own code, track record and limits, and tells you honestly
   /proactive [on|off|now]  from Lucid it reports bugs and suggests ideas unprompted; 'now' looks right away
-  /fix                fix the last bug it reported on its own
+  /fix                fix the last bug it reported on its own (it also offers this when it reports one)
+  /auto [on|off]      answer yes to approval prompts for this session, like --yes (destructive
+                      commands, high-risk files, and code-running commands with no OS sandbox
+                      still ask); unprompted bug reports are then fixed without asking first
   /done               tell it the project is finished: it suggests new programs to build
   /self               its self-model: identity, history, track record, last reflection
   /quiet              toggle on-the-fly hints
@@ -219,6 +222,9 @@ if (opt.print !== undefined) {
 const term = new Terminal();
 awareness.startSession();
 let quiet = opt.quiet;
+// Session-wide auto-approve: starts from --yes, toggled with /auto. Same rails as --yes
+// (makeToolRunner still asks for destructive commands, high-risk files and unsandboxed code).
+let autoYes = opt.yes;
 const cooldownMs = Math.max(0, Number(opt.cooldown) || 0) * 1000;
 let lastHintAt = 0, queued = null, queueTimer = null;
 let watcher;
@@ -318,12 +324,12 @@ async function exclusive(fn) {
 const converse = (text, mode) => exclusive(async () => {
   announce(awareness.feed(mode === 'code' ? 'code' : 'ask'));
   if (mode === 'code' && cloudShell) return runCloudInTerminal(text);
-  await runAgent(agent, text, mode, { root, autoYes: opt.yes }, mode === 'code' ? '\n⚙  working…' : '');
+  await runAgent(agent, text, mode, { root, autoYes }, mode === 'code' ? '\n⚙  working…' : '');
 });
 
 /** /code in the cloud: stream the session here; every returned change goes through local approval. */
 async function runCloudInTerminal(text) {
-  const runTool = makeToolRunner({ root, selfDir, awareness, term, autoYes: opt.yes, shell, signal: currentAbort.signal,
+  const runTool = makeToolRunner({ root, selfDir, awareness, term, autoYes, shell, signal: currentAbort.signal,
     onWrite: (rel, content) => { watcher?.noteSelfWrite(rel, content); if (path.normalize(rel) === 'AWAKEN.md') awareness.trustNotes(root, notesHash(content.slice(0, 20_000))); } });
   term.beginStream(c.cyan('\n☁  working in Claude\'s cloud sandbox…'));
   awareness.note('cloudRuns');
@@ -372,8 +378,21 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
       ideas: c.cyan('\n💭 While you paused, a few ideas:'),
       programs: c.magenta('\n🌱 Ideas for what to build next:'),
     }[kind];
-    const tail = kind === 'bugs' ? c.dim('  /fix to have me fix it · /proactive off to silence me') : c.dim('  /code <idea> to start one · /proactive off to silence me');
+    const tail = kind === 'bugs' ? c.dim('  /proactive off to silence me') : c.dim('  /code <idea> to start one · /proactive off to silence me');
     term.print(`${head}\n${text.replace(/^(?!\s)/gm, '  ')}\n${tail}`);
+    if (kind === 'bugs') void offerFix(text);
+  };
+  // Implement the finding, but only with your OK: ask first (skipped under /auto), and every
+  // edit or command inside the fix still goes through the normal approval prompts.
+  const offerFix = async (text) => {
+    try {
+      if (!autoYes) {
+        const ok = await yes('  Fix it now? (each edit still shows a diff and asks)');
+        if (!ok) return term.print(c.dim('  ok — /fix later if you change your mind'));
+      } else term.print(c.dim('  /auto is on — fixing it now (destructive or high-risk steps still ask)'));
+      if (lastFinding !== text || term.busy) return; // something newer, or you started something meanwhile
+      await fixFinding(text);
+    } catch (e) { awareness.note('errors', `offerFix: ${e.message}`); }
   };
   proactive = new Proactive({
     awareness, isFree, show, isQuiet: () => quiet,
@@ -391,6 +410,11 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
   });
 }
 
+function fixFinding(text) {
+  awareness.note('proactiveFixed');
+  return converse(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${text}`, 'code');
+}
+
 // ---------- self-evolution ----------
 const evolve = (idea) => exclusive(async () => {
   const home = homeDir();
@@ -405,7 +429,7 @@ const evolve = (idea) => exclusive(async () => {
   const twin = new Agent({ awareness, root: sandboxDir, selfDir, model: opt.model, fastModel: opt['fast-model'], client: agent.client, sandboxReport });
   // Edits inside the sandbox copy are auto-approved (they can't touch the live version);
   // in evolve mode the agent has no shell — only the confined run_tests tool.
-  const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandboxDir, autoWrites: true, autoCommands: opt.yes }, '\n🧬 evolving…');
+  const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandboxDir, autoWrites: true, autoCommands: autoYes }, '\n🧬 evolving…');
   if (!finished) return reject(c.dim(`  Evolution abandoned. The sandbox is left at ${sandboxDir}.`));
 
   const symlinks = [];
@@ -589,8 +613,16 @@ async function handle(line) {
     }
     case '/fix':
       if (!lastFinding) return term.print(c.dim('  I haven\'t reported a bug on my own yet. (/code <task> to fix something specific.)'));
-      awareness.note('proactiveFixed');
-      return converse(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${lastFinding}`, 'code');
+      return fixFinding(lastFinding);
+    case '/auto':
+      if (arg === 'on') autoYes = true;
+      else if (arg === 'off') autoYes = false;
+      else if (arg === '') autoYes = !autoYes;
+      else return term.print(c.dim('  usage: /auto [on|off]'));
+      return term.print(autoYes
+        ? c.yellow('  /auto on — I\'ll answer yes to edit and command prompts, and fix bugs I report without asking first.') +
+          c.dim(`\n  Still asks: destructive commands, high-risk files (package.json, hooks, CI, AWAKEN.md)${shell.os || shell.allowUnsandboxed ? '' : ', and code-running commands (no OS sandbox here)'}. /auto off to stop.`)
+        : c.dim('  /auto off — I\'ll ask before every change again.'));
     case '/done':
       if (!proactive) return term.print(c.dim('  Proactive mode is disabled for this session.'));
       term.print(c.magenta('  ✦ Finished? Nice. Let me think about what\'s next…'));

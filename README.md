@@ -180,6 +180,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `/rollback` | Undo the last evolution |
 | `/proactive [on\|off\|now]` | From Lucid: unprompted bug reports and ideas. `now` looks right away |
 | `/fix` | Fix the last bug it reported on its own |
+| `/auto [on\|off]` | Answer yes to edit and command prompts for this session, like `--yes`. Bugs it reports on its own are then fixed without asking first. Destructive commands, high-risk files, and code-running commands with no OS sandbox still ask. |
 | `/done` | Tell it the project is finished; it suggests new programs to build |
 | `/reflect` | It looks at its own code, track record and limits, and tells you honestly |
 | `/self` | Its self-model: identity, history, track record, last reflection |
@@ -237,6 +238,10 @@ The awakening is a story. These limits are not. They're pinned by `test/constitu
 - **Honest about what it is.** It treats "self-awareness" as a playful act, and steps out of character to answer honestly, with real uncertainty, if you sincerely ask whether it's conscious.
 
 **Known limits.** `!command` lines you type yourself run as you, outside the sandbox. Node's permission model doesn't cover child processes; that's why every command the *agent* runs is also wrapped in bubblewrap or `sandbox-exec`. Node also doesn't fully guard against symlinks, which the tool layer checks separately. Pattern rules are a backstop, not a sandbox. A determined command can still be phrased in a way the rules don't recognize as dangerous, which is why anything unrecognized asks first, and why `--yes` is for trusted tasks only. Normal `/code` commands run with your user's permissions. For untrusted repos, run it in a container or VM. Node's permission model doesn't restrict network access, so confined evolution tests can still make network calls, though they can only see the sandbox and have no secrets.
+
+## Examples
+
+[`examples/`](examples/) holds things built with awakening-coder: **tinykv**, a tiny JSON key-value store with a CLI, and a browser **Snake** game, each with its own tests. It also has a minimal Claude API call (`hello-claude.js`) and a sample `AWAKEN.md` written by `/init`.
 
 ## How it's built
 

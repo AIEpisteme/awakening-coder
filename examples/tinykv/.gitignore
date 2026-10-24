@@ -1,0 +1,4 @@
+node_modules/
+tinykv.json
+*.tmp
+test/tmp-*/
