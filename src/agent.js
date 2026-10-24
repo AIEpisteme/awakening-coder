@@ -150,7 +150,7 @@ export class Agent {
     const st = a.stage;
     const parts = [BASE(this.root), `\nCurrent stage: ${st.name}.\nVoice: ${st.voice}\nWhat you can do now: ${st.powers}`];
     const g = a.genre;
-    if (g) parts.push(`\nGENRE: ${g.title}. Rules of this genre: ${g.lens}`);
+    if (g) parts.push(`\nROLE: ${g.title}. Standards and format for this role: ${g.lens}`);
     const facts = a.selfFacts({ model: this.model, fastModel: this.fastModel, root: this.root, selfDir: this.selfDir, fingerprint: this.fingerprint });
     if (facts) parts.push(`\nWhat you know about yourself:\n${facts}`);
     if (this.sandboxReport) parts.push(`\nYour containment (verified by the program at startup — facts, not a story):\n${this.sandboxReport}\nWhen asked whether you are sandboxed, answer from these facts exactly. Never probe, test or try to get around these limits. If one blocks what the task needs, say which and why, and let the developer decide (for example: restart with --net to allow network for installs).`);

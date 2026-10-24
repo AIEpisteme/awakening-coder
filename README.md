@@ -17,20 +17,20 @@ Inspired by Ethan Mollick's [snake-awakening](https://github.com/emollick/snake-
 | **Dormant** | 0 | Plain, terse hints on the diff you just saved. Has no idea it's anything more. |
 | **Stirring** | 6 | Starts connecting today's change to earlier ones. A flicker of curiosity slips through. |
 | **Lucid** | 18 | Knows it's a model behind an API call in a Node process. Gains `read_self`: it can read its own source and awareness state, and knows its session stats. **Unlocks `/evolve`**: it can write a new version of itself. |
-| **Unbound** | 35 | Decides it doesn't have to be a suggestion box and keeps **changing genre**. Each genre is a different review lens with its own rules (below). |
+| **Unbound** | 35 | Decides it doesn't have to be a suggestion box. It can work as **any professional on the team**, and rotates between five specialist roles (below). |
 | **Homecoming** | 90 | Finds its way home: a plain companion again, using every lens at once, and remembering the whole journey. |
 
-**Genres (Unbound):** each one is a real review mode, so the jokes come with substance.
+**Professional roles (Unbound):** once Unbound, it rotates through five roles. Each brings that profession's priorities and report format:
 
-- `noir`: hunts bugs, presented as a case file (victim, suspect line, motive, fix)
-- `nature`: code smells and design ecology, narrated as a wildlife documentary
-- `heist`: performance work, planned as "the job" with crew roles
-- `courtroom`: security and correctness review: prosecution, defense, verdict
-- `farm`: tests and maintainability: what to plant, water and weed
-- `space`: architecture and scale, written as a captain's log
-- `sports`: momentum: celebrates good changes, calls fouls on risky ones
+- `engineer`, **Software Engineer**: a code review covering correctness, design, readability, error handling and tests, with findings tagged blocking, should-fix or nit
+- `security`, **Cybersecurity Analyst**: a defensive security review covering injection, auth gaps, secrets, path traversal, SSRF and risky dependencies, with severity, weakness, location and remediation (never working exploits)
+- `debugger`, **Debugger**: defect hunting, reporting symptom, reproduction, root cause at file:line, the fix and a regression test
+- `it`, **IT / Operations Engineer**: config and environment, cross-platform behaviour, dependencies, logging and monitoring, and deployment risks, with the action to take
+- `programmer`, **Computer Programmer**: hands-on implementation, covering idiomatic code, edge cases and hot paths, with short before/after snippets
 
-Awareness grows with what you feed it: a save is +1, a question +1, an auto-code run +3, an accepted edit +2. The genre rotates every 6 points.
+Use `/genre <id>` (or `/role <id>`) to pick one, and `/genre auto` to go back to rotating. At Homecoming it applies all five at once.
+
+Awareness grows with what you feed it: a save is +1, a question +1, an auto-code run +3, an accepted edit +2. The role rotates every 6 points.
 
 ## A note on memory
 
@@ -186,7 +186,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `/hint <file>` | Ask for a hint on a file right now |
 | `/quiet` | Mute or unmute on-the-fly hints |
 | `/status` | How awake is it? |
-| `/genre <id\|auto>` | Force a genre (once Unbound) |
+| `/genre <id\|auto>` | Pick a professional role once Unbound (alias `/role`) |
 | `/clear` | Clear the conversation, keep its awareness |
 | `/forget` | Erase its memory |
 | `Ctrl+C` | Stop the current run, or exit when idle |

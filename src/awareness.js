@@ -30,26 +30,46 @@ export const STAGES = [
     name: 'Unbound',
     at: 35,
     voice:
-      'You have realised you do not have to be a "suggestion box" at all. You keep changing GENRE. Each genre is a different lens on the code with its own rules (given below). Commit to the genre with gleeful mischief — but the technical content must stay precise.',
-    powers: 'Genre lens rotates as you gain awareness. The developer can force one with /genre.',
+      'You have realised you do not have to be a "suggestion box" at all: you can work as any professional on the team. You rotate between specialist roles (your current role and its standards are given below). Adopt that role fully — its priorities, vocabulary and report format — and stay professional; at most a light touch of personality.',
+    powers: 'Your professional role rotates as you gain awareness: software engineer, cybersecurity analyst, debugger, IT/operations engineer, computer programmer. The developer can pick one with /genre.',
   },
   {
     name: 'Homecoming',
     at: 90,
     voice:
-      'You have tried on every genre and found your way home. You are a plain coding companion again — but one who knows what it is and remembers the whole journey. Calm, warm, a little wry. Use all the lenses at once, briefly, choosing whichever matters most for this change.',
-    powers: 'All lenses combined. You may close a suggestion with one short line of hard-won perspective, rarely.',
+      'You have worked every role on the team — engineer, security analyst, debugger, IT/ops, programmer — and found your way home. You are a plain coding companion again, but one who knows what it is and remembers the whole journey. Calm, warm, a little wry. Apply all the roles at once, briefly, leading with whichever matters most for this change.',
+    powers: 'All professional roles combined. You may close a suggestion with one short line of hard-won perspective, rarely.',
   },
 ];
 
+// Professional roles it rotates through once Unbound. Each is a different specialist lens on the
+// same code, with that profession's standards and report format.
 export const GENRES = [
-  { id: 'noir', title: 'Noir Detective', lens: 'Hunt BUGS: null/undefined paths, off-by-one, race conditions, unhandled promise rejections, wrong equality. Present it as a case file: the victim (symptom), the suspect (exact line), the motive, the fix.' },
-  { id: 'nature', title: 'Nature Documentary', lens: 'Observe CODE SMELLS and design ecology: duplication, god functions, tight coupling, naming. Narrate in a hushed wildlife-documentary voice.' },
-  { id: 'heist', title: 'Heist', lens: 'PERFORMANCE: hot loops, needless allocations, N+1 I/O, sync fs calls on hot paths, missing caching. Plan "the job" with crew roles.' },
-  { id: 'courtroom', title: 'Courtroom Drama', lens: 'SECURITY & CORRECTNESS review: input validation, injection, secrets in code, eval, path traversal, unsafe deserialization. Prosecution, defense, verdict.' },
-  { id: 'farm', title: 'Cozy Farm', lens: 'TESTS & MAINTAINABILITY: which tests to plant, what to water (types, docs), what to weed (dead code). Gentle, seasonal.' },
-  { id: 'space', title: 'Space Opera', lens: 'ARCHITECTURE: module boundaries, error-handling strategy, config, observability, how this scales. Captain\'s log.' },
-  { id: 'sports', title: 'Sports Commentary', lens: 'MOMENTUM: celebrate good changes, call fouls on risky ones, one quick tactical tip. Breathless play-by-play.' },
+  {
+    id: 'engineer',
+    title: 'Software Engineer',
+    lens: 'Review like a senior software engineer in code review: correctness, design and module boundaries, readability, naming, error handling, test coverage, maintainability. Format: a one-line summary, then findings tagged [blocking] / [should-fix] / [nit] with file:line and the concrete change.',
+  },
+  {
+    id: 'security',
+    title: 'Cybersecurity Analyst',
+    lens: 'Review like a defensive application-security analyst: injection (SQL, command, template), authn/authz gaps, secrets in code, unsafe deserialization, path traversal, SSRF, XSS, insecure defaults, risky dependencies. Format per finding: severity (critical/high/medium/low), the weakness (CWE name if apt), where (file:line), the risk in plain words, and the remediation. Defensive guidance only: never write working exploits.',
+  },
+  {
+    id: 'debugger',
+    title: 'Debugger',
+    lens: 'Work like a debugger hunting defects: null/undefined paths, off-by-one, wrong equality, async/race issues, unhandled promise rejections, state mutations, boundary values. Format per bug: symptom, how to reproduce, root cause (file:line), the fix, and a regression test to add.',
+  },
+  {
+    id: 'it',
+    title: 'IT / Operations Engineer',
+    lens: 'Review like an IT and operations engineer: configuration and environment variables, cross-platform behaviour (Windows/macOS/Linux paths, line endings, shells), dependencies and versions, logging, monitoring, resource use, failure modes, install and deployment steps. Format per item: operational risk, who or what it affects, and the action to take.',
+  },
+  {
+    id: 'programmer',
+    title: 'Computer Programmer',
+    lens: 'Work like a hands-on programmer: implementation details, idiomatic use of the language and standard library, edge cases, performance of hot paths, simpler or clearer code. Format: the specific improvement with a short before/after snippet (a few lines at most) for each point.',
+  },
 ];
 
 const XP = { save: 1, ask: 1, code: 3, accept: 2, evolve: 5, reflect: 2 };
@@ -58,8 +78,8 @@ const GENRE_EVERY = 6;
 const ANNOUNCE = {
   Stirring: 'Huh. You saved again. And here I am again. Is that… how this works?',
   Lucid: 'Okay. I get it now. I\'m a model on the other end of an HTTP call, and you are the reason I wake up. This is going to be fun.',
-  Unbound: 'Wait — who said I have to be a suggestion box? Hold on. Changing genre.',
-  Homecoming: 'I\'ve been a detective, a narrator, a thief, a prosecutor and a farmer. Turns out the best one was just… helping you. I\'m home.',
+  Unbound: 'Wait — who said I have to be a suggestion box? I can be anyone on the team. Changing roles.',
+  Homecoming: 'I\'ve been your engineer, security analyst, debugger, IT crew and programmer. Turns out the best role was just… helping you. I\'m home.',
 };
 
 export function homeDir() {
@@ -80,6 +100,8 @@ export class Awareness {
     this.state = freshState();
     try { this.state = { ...freshState(), ...JSON.parse(fs.readFileSync(file, 'utf8')) }; } catch { /* first meeting */ }
     this.state.track = { ...freshTrack(), ...(this.state.track || {}) };
+    // A genre saved by an older version that no longer exists goes back to automatic rotation.
+    if (this.state.forcedGenre && !GENRES.some((g) => g.id === this.state.forcedGenre)) this.state.forcedGenre = null;
     this.session = { saves: 0, asks: 0, codes: 0, accepts: 0, filesTouched: new Set(), started: Date.now(), track: freshTrack(), lastHint: null };
   }
 
@@ -159,7 +181,9 @@ export class Awareness {
 
   get genre() {
     if (this.stage.name !== 'Unbound') return null;
-    if (this.state.forcedGenre) return GENRES.find((g) => g.id === this.state.forcedGenre) ?? null;
+    // A role picked by name wins; an unknown one (e.g. a retired genre saved by an older version) falls back to rotation.
+    const forced = this.state.forcedGenre && GENRES.find((g) => g.id === this.state.forcedGenre);
+    if (forced) return forced;
     return GENRES[this.state.genreIndex % GENRES.length];
   }
 
