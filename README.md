@@ -102,6 +102,27 @@ By default, `/code` and headless `-p` don't run any commands on your computer. T
 
 It only needs `ANTHROPIC_API_KEY`. Use a key created inside a workspace; keys that span several workspaces also need `ANTHROPIC_WORKSPACE_ID`. To run commands on your own machine instead, use `--shell local`. Questions, save-hints and `/evolve` still run locally.
 
+## Web app: talk to it and let it code in your browser
+
+```bash
+npm run web -- /path/to/project another/project     # or: node src/web.js <folders…> [--open] [--port 7357]
+```
+
+It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
+
+- **Chat** with an **Ask / Code** switch. Answers stream in as they're written. In Code mode it plans, edits and runs tests, the same as `/code`.
+- **Approval cards.** Every edit appears as a colored diff and every command is shown before it runs, each with **Approve** and **Decline** buttons. The rules match the terminal: destructive commands and high-risk files always ask, and the **auto-approve** checkbox works like `/auto`.
+- **Projects.**
+  - **Local folders:** the folders you passed when starting it. These set its sandbox.
+  - **GitHub repos:** paste a GitHub URL to clone it into `~/.awakening-coder/repos/` and work on it there.
+- **Files.** Browse the project; secret files are hidden and keys are redacted.
+- **Git panel.**
+  - **Branch and diff:** see the current branch and diff.
+  - **Commit:** refuses secret files and inline keys.
+  - **Push:** uses your own git credentials, after you confirm.
+
+It listens on `127.0.0.1` only. Every request needs the random token from the printed link and a matching Host and Origin, so other websites can't drive it, including through DNS rebinding. The page runs under a strict Content Security Policy, and it confines itself like the terminal version. `--shell cloud` runs Code mode in Claude's cloud sandbox.
+
 ## It knows whether it's sandboxed, and sandboxes itself
 
 Ask it "are you sandboxed?" and it answers from facts the program checked at startup, not from a story. Run `/sandbox` to see the same report:
@@ -254,6 +275,8 @@ src/awareness.js  stages, genres, persistent memory
 src/agent.js      stage-aware prompts, streamed hints, auto-code tool loop
 src/security.js   the whole policy: secret files, redaction, env scrub, shell rules, high-risk files, tamper scan
 src/tools.js      sandboxed files (symlink-safe), glob, grep, edit, shell, todos, confined run_tests, read_self
+src/web.js        the browser app: local-only server (token, host/origin checks, CSP), chat, approvals, GitHub clone, git panel
+src/web-ui.html   its page: vanilla HTML/CSS/JS, light and dark, phone-friendly
 src/cloud.js      /code in Claude Managed Agents: pack, upload, stream, hand back changes, clean up
 src/proactive.js  unprompted bug watch, feature and new-program ideas (Lucid+), with manners and a budget
 src/tar.js        dependency-free tar for shipping the project and reading back changes
