@@ -173,3 +173,24 @@ test('workspace-not-found and HIPAA errors get clear fixes', () => {
   assert.match(explainApiError(hipaa), /--shell local/);
   assert.equal(isCloudUnavailable(hipaa), true);
 });
+
+test('Unbound rotates through five professional roles; old saved genres fall back safely', async () => {
+  const { GENRES } = await import('../src/awareness.js');
+  assert.deepEqual(GENRES.map((g) => g.id), ['engineer', 'security', 'debugger', 'it', 'programmer']);
+  assert.match(GENRES.find((g) => g.id === 'security').lens, /never write working exploits/);
+  const a = new Awareness(path.join(tmp(), 's.json'));
+  a.state.xp = 35;
+  const seen = new Set();
+  for (let i = 0; i < 30; i++) { a.feed('save', 'x.js'); seen.add(a.genre.id); }
+  assert.equal(seen.size, 5, 'every role comes up');
+  assert.ok(a.forceGenre('debugger'));
+  assert.equal(a.genre.title, 'Debugger');
+  assert.equal(a.forceGenre('noir'), false, 'retired genres are not accepted');
+  a.state.forcedGenre = 'noir'; // saved by an older version
+  assert.ok(GENRES.includes(a.genre), 'falls back to rotation instead of no role');
+  const file = path.join(tmp(), 'old.json');
+  fs.writeFileSync(file, JSON.stringify({ xp: 40, forcedGenre: 'noir' }));
+  const old = new Awareness(file);
+  assert.equal(old.state.forcedGenre, null, 'cleared on load');
+  assert.ok(!/forced/.test(old.describe()));
+});

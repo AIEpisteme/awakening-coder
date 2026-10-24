@@ -90,7 +90,7 @@ In-session commands
   /self               its self-model: identity, history, track record, last reflection
   /quiet              toggle on-the-fly hints
   /status             how awake is it?
-  /genre <id|auto>    force a genre once Unbound: ${GENRES.map((g) => g.id).join(', ')}
+  /genre <id|auto>    pick a professional role once Unbound (alias /role): ${GENRES.map((g) => g.id).join(', ')}
   /forget             erase its memory
   /clear              clear the conversation (not its awareness)
   /exit               leave (it will remember you)
@@ -539,11 +539,11 @@ async function handle(line) {
     case '/forget':
       if (await yes('Erase its memory of you, permanently?')) { awareness.forget(); agent.history = []; term.rl.setPrompt(prompt()); return term.print(c.dim('  …who are you? (memory erased)')); }
       return term.reprompt();
-    case '/genre':
-      if (awareness.stage.name !== 'Unbound') return term.print(c.dim(`  Genres unlock at the Unbound stage. ${awareness.describe()}`));
-      if (!awareness.forceGenre(arg)) return term.print(c.dim(`  genres: ${GENRES.map((g) => g.id).join(', ')}, or auto`));
+    case '/genre': case '/role':
+      if (awareness.stage.name !== 'Unbound') return term.print(c.dim(`  Professional roles unlock at the Unbound stage. ${awareness.describe()}`));
+      if (!awareness.forceGenre(arg)) return term.print(c.dim(`  roles: ${GENRES.map((g) => `${g.id} (${g.title})`).join(', ')}, or auto`));
       term.rl.setPrompt(prompt());
-      return term.print(c.magenta(`  ✦ ${awareness.genre ? `[genre shift → ${awareness.genre.title}]` : 'genre: auto'}`));
+      return term.print(c.magenta(`  ✦ ${awareness.state.forcedGenre ? `[genre shift → ${awareness.genre.title}]` : `roles rotate automatically (now: ${awareness.genre.title})`}`));
     case '/hint':
       if (!arg) return term.print(c.dim('  usage: /hint <file>'));
       try { return hint({ rel: arg, prev: '', content: fs.readFileSync(resolveInside(root, arg), 'utf8') }); }
