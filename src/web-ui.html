@@ -67,6 +67,14 @@ pre.tool .del { color: var(--del); background: var(--del-bg); display: block; }
 .viewer pre { margin: 0; flex: 1; overflow: auto; padding: 14px; font: 12px/1.5 var(--mono); }
 .muted { color: var(--muted); font-size: 12px; }
 .gitdiff { max-height: 40vh; }
+.card { max-width: 860px; border-radius: 10px; padding: 10px 12px; border: 1px solid var(--line); background: var(--panel); }
+.card .title { font-weight: 600; margin-bottom: 4px; }
+.card .body { white-space: pre-wrap; word-wrap: break-word; }
+.card.hint { border-left: 4px solid var(--accent); }
+.card.bugs { border-left: 4px solid var(--del); background: var(--del-bg); }
+.card.ideas, .card.programs { border-left: 4px solid var(--add); }
+.card .row { margin-top: 8px; }
+#savedLine { min-height: 1em; }
 input.check { width: auto; }
 .spaced { margin: 8px 0; }
 @media (max-width: 1100px) { .app { grid-template-columns: 220px 1fr; } .side { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); } }
@@ -84,6 +92,10 @@ input.check { width: auto; }
     <span class="chip" id="stage">…</span>
     <span class="chip" id="project">no project</span>
     <span class="spacer"></span>
+    <label class="row muted" title="A short hint after each save in your editor"><input type="checkbox" id="hints" class="check" checked> hints</label>
+    <label class="row muted" id="proLabel" title="From the Lucid stage: unprompted bug reports after you pause, and ideas"><input type="checkbox" id="pro" class="check" checked> proactive</label>
+    <button id="lookNow" title="Look for bugs and ideas right now (Lucid and later)">Look now</button>
+    <button id="doneBtn" title="Tell it the project is finished: it suggests new programs to build">Project done?</button>
     <label class="row muted" title="Answer yes to edit and command prompts this session (destructive commands and high-risk files still ask)"><input type="checkbox" id="auto" class="check"> auto-approve</label>
     <button id="sandboxBtn">Sandbox</button>
   </header>
@@ -115,7 +127,7 @@ input.check { width: auto; }
         <button class="primary" id="send">Send</button>
         <button id="stop" disabled>Stop</button>
         <button id="clear" title="Forget this conversation (its awareness is kept)">New conversation</button>
-        <span class="spacer"></span><span class="muted">Ctrl+Enter to send</span>
+        <span class="spacer"></span><span class="muted" id="savedLine"></span><span class="muted">Ctrl+Enter to send</span>
       </div>
     </div>
   </main>
@@ -173,6 +185,11 @@ input.check { width: auto; }
     const cur = s.projects.find((p) => p.id === s.current);
     $('project').textContent = cur ? cur.name : 'no project';
     $('auto').checked = !!s.autoYes;
+    $('hints').checked = !!s.hints;
+    const pro = s.proactive || {};
+    $('proLabel').hidden = !pro.available; $('lookNow').hidden = !pro.available; $('doneBtn').hidden = !pro.available;
+    $('pro').checked = !!pro.enabled;
+    $('proLabel').title = pro.status ? 'Proactive: ' + pro.status : $('proLabel').title;
     $('send').disabled = !!s.busy; $('stop').disabled = !s.busy;
     const list = $('projects'); list.replaceChildren();
     for (const p of s.projects) {
@@ -230,6 +247,26 @@ input.check { width: auto; }
       }
       case 'answered': { const card = log.querySelector(`.ask[data-id="${CSS.escape(ev.id)}"]`); if (card) { card.querySelectorAll('button').forEach((b) => b.remove()); card.append(el('span', 'muted', 'answered')); } break; }
       case 'error': note(ev.text, 'error'); bubble = null; break;
+      case 'saved': $('savedLine').textContent = 'saved ' + ev.rel + ' · '; break;
+      case 'hint': {
+        const card = el('div', 'card hint'); card.dataset.hint = ev.id;
+        card.append(el('div', 'title', '💡 ' + ev.rel + (ev.label ? ' · ' + ev.label : '')), el('div', 'body', ''));
+        log.append(card); scroll(); break;
+      }
+      case 'hint-text': { const b = log.querySelector(`[data-hint="${CSS.escape(ev.id)}"] .body`); if (b) { b.textContent += ev.text; scroll(); } break; }
+      case 'hint-end': break;
+      case 'proactive': {
+        const titles = { bugs: '🔎 Unprompted — I think I found something', ideas: '💭 While you paused, a few ideas', programs: '🌱 Ideas for what to build next' };
+        const card = el('div', 'card ' + ev.kind);
+        card.append(el('div', 'title', titles[ev.kind] || 'Note'), el('div', 'body', ev.text));
+        const row = el('div', 'row');
+        if (ev.kind === 'bugs') {
+          const fix = el('button', 'primary', 'Fix it');
+          fix.onclick = () => { fix.disabled = true; setMode('code'); api('/api/fix', {}).catch((e) => { fix.disabled = false; note(e.message, 'error'); }); };
+          row.append(fix, el('span', 'muted', 'Each edit still shows a diff for you to approve.'));
+        } else row.append(el('span', 'muted', 'Switch to Code and describe one to start it.'));
+        card.append(row); log.append(card); bubble = null; scroll(); break;
+      }
       case 'done': bubble = null; loadGit(); loadFiles(); break;
     }
   }
@@ -259,6 +296,10 @@ input.check { width: auto; }
   $('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
   $('stop').onclick = () => api('/api/stop', {}).catch((e) => note(e.message, 'error'));
   $('clear').onclick = () => api('/api/clear', {}).then(() => { log.replaceChildren(); note('New conversation. (Its awareness and memory of you are kept.)'); }).catch((e) => note(e.message, 'error'));
+  $('hints').onchange = (e) => api('/api/hints', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
+  $('pro').onchange = (e) => api('/api/proactive', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
+  $('lookNow').onclick = () => { note('Looking for bugs and ideas…'); api('/api/proactive', { action: 'now' }).catch((e) => note(e.message, 'error')); };
+  $('doneBtn').onclick = () => { note('Finished? Nice. Thinking about what to build next…'); api('/api/proactive', { action: 'done' }).catch((e) => note(e.message, 'error')); };
   $('auto').onchange = (e) => api('/api/auto', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
   $('sandboxBtn').onclick = () => { if (state) note(state.sandbox + (state.info ? '\n' + state.info : '')); };
   $('ghForm').onsubmit = (e) => {
@@ -273,7 +314,7 @@ input.check { width: auto; }
   $('viewerClose').onclick = () => $('viewer').classList.remove('open');
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('viewer').classList.remove('open'); });
 
-  note('Hi. Pick a project on the left (or clone a GitHub repo), then ask me something — or switch to Code and tell me what to build.');
+  note('Hi. Pick a project (or clone a GitHub repo), then ask me something, or switch to Code and tell me what to build. Keep editing in your own editor: I\'ll leave a hint when you save, and from Lucid I\'ll tell you about bugs I spot on my own.');
   connect(); loadFiles(); loadGit();
 })();
 </script>

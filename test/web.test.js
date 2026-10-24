@@ -16,6 +16,8 @@ const SPAWNS = { skip: isConfined() && 'spawns processes; covered by the unconfi
 // A fake agent: in code mode it proposes one edit through the real tool runner.
 const fakeAgent = (root) => ({
   history: [],
+  cancelSuggestion() {},
+  async suggest({ rel }, { onStart, onText }) { onStart(); onText(`check ${rel}: possible off-by-one`); return 'x'; },
   async converse(text, { mode, runTool, onText }) {
     onText(`(${mode}) `);
     if (mode === 'code') onText(String(await runTool('write_file', { path: 'hello.txt', content: 'hi from the web\n' })));
@@ -179,4 +181,103 @@ test('commit refuses secret files and inline keys (real git)', SPAWNS, async () 
     const info = await (await s2.call('/api/git')).json();
     assert.equal(info.isRepo, true);
   } finally { s2.stop(); }
+});
+
+// ---------- live features: save-hints and unprompted reports ----------
+async function startLive({ lucid = true, scoutReply = '- [a.js:1] (high) x used before defined — throws — declare x first', hintCooldownMs = 0 } = {}) {
+  const watchers = [];
+  const awareness = new Awareness(path.join(tmp(), 's.json'));
+  if (lucid) awareness.state.xp = 20;
+  const s = await start({
+    app: {
+      awareness, hintCooldownMs, proactiveConfig: { bugIdleMs: 50, ideaIdleMs: 60_000, retryMs: 20 },
+      watch: async (root, onChange) => { const w = { root, onChange, closed: false, self: [], close() { this.closed = true; }, noteSelfWrite(rel) { this.self.push(rel); } }; watchers.push(w); return w; },
+      scout: async (mode) => (mode === 'scout_bugs' ? scoutReply : 'NOTHING'),
+    },
+  });
+  await new Promise((r) => setTimeout(r, 50)); // watcher starts on 'listening'
+  return { ...s, watchers, awareness };
+}
+
+test('saving a file shows a hint card in the browser', async () => {
+  const s = await startLive({ lucid: false });
+  try {
+    assert.equal(s.watchers.length, 1);
+    s.watchers[0].onChange({ rel: 'a.js', prev: 'let a = 1;\n', content: 'let a = 2;\n' });
+    const h = await s.waitFor((e) => e.type === 'hint');
+    assert.equal(h.rel, 'a.js');
+    await s.waitFor((e) => e.type === 'hint-text' && /off-by-one/.test(e.text));
+    await s.waitFor((e) => e.type === 'hint-end');
+    assert.ok(s.events.some((e) => e.type === 'saved' && e.rel === 'a.js'));
+  } finally { s.stop(); }
+});
+
+test('hints can be turned off from the browser', async () => {
+  const s = await startLive({ lucid: false });
+  try {
+    await s.call('/api/hints', { body: { on: false } });
+    s.watchers[0].onChange({ rel: 'a.js', prev: 'a\n', content: 'b\n' });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.ok(!s.events.some((e) => e.type === 'hint'));
+    assert.equal((await (await s.call('/api/state')).json()).hints, false);
+  } finally { s.stop(); }
+});
+
+test('from Lucid, a pause after saving brings an unprompted bug report; Fix it starts a code run', async () => {
+  const s = await startLive();
+  try {
+    s.watchers[0].onChange({ rel: 'a.js', prev: '', content: 'console.log(x); let x = 1;\n' });
+    const bug = await s.waitFor((e) => e.type === 'proactive' && e.kind === 'bugs');
+    assert.match(bug.text, /a\.js:1/);
+    assert.equal((await s.call('/api/fix', { body: {} })).status, 202);
+    await s.waitFor((e) => e.type === 'start' && e.mode === 'code');
+    const q = await s.waitFor((e) => e.type === 'question');
+    await s.call('/api/answer', { body: { id: q.id, answer: 'n' } });
+    await s.waitFor((e) => e.type === 'done');
+    assert.equal(s.awareness.state.track.proactiveFixed, 1);
+  } finally { s.stop(); }
+});
+
+test('below Lucid there are no unprompted reports, and Look now explains why', async () => {
+  const s = await startLive({ lucid: false });
+  try {
+    s.watchers[0].onChange({ rel: 'a.js', prev: '', content: 'x\n' });
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(!s.events.some((e) => e.type === 'proactive'));
+    const r = await s.call('/api/proactive', { body: { action: 'now' } });
+    assert.equal(r.status, 400);
+    assert.match((await r.json()).error, /Lucid/);
+  } finally { s.stop(); }
+});
+
+test('switching projects moves the watcher; its own edits never trigger hints', async () => {
+  const s = await startLive({ lucid: false });
+  try {
+    await s.call('/api/message', { body: { text: 'add hello', mode: 'code' } });
+    const q = await s.waitFor((e) => e.type === 'question');
+    await s.call('/api/answer', { body: { id: q.id, answer: 'y' } });
+    await s.waitFor((e) => e.type === 'done');
+    assert.deepEqual(s.watchers[0].self, ['hello.txt'], 'the watcher is told about the agent\'s own write');
+    // Switch to a (fake-)cloned GitHub repo: the old watcher closes, a new one watches the clone.
+    const r = await s.call('/api/project', { body: { github: 'https://github.com/a/b' } });
+    assert.equal(r.status, 502, 'default fake git fails the clone; nothing switches');
+    assert.equal(s.watchers.length, 1);
+    assert.equal(s.watchers[0].closed, false);
+  } finally { s.stop(); }
+});
+
+test('switching to another project closes the old watcher and watches the new one', async () => {
+  const watchers = [];
+  const s = await start({
+    git: async (args) => { if (args[0] === 'clone') fs.mkdirSync(path.join(args.at(-1), '.git'), { recursive: true }); return { code: 0, out: '' }; },
+    app: { watch: async (root, onChange) => { const w = { root, onChange, closed: false, close() { this.closed = true; }, noteSelfWrite() {} }; watchers.push(w); return w; } },
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(watchers.length, 1);
+    await s.call('/api/project', { body: { github: 'https://github.com/a/b' } });
+    assert.equal(watchers.length, 2);
+    assert.equal(watchers[0].closed, true);
+    assert.match(watchers[1].root, /a__b$/);
+  } finally { s.stop(); }
 });
