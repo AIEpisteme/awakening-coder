@@ -120,6 +120,13 @@ It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
   - **Branch and diff:** see the current branch and diff.
   - **Commit:** refuses secret files and inline keys.
   - **Push:** uses your own git credentials, after you confirm.
+- **Save-hints.** Keep editing in your own editor. When you save, a 💡 hint card appears in the chat with a short note on what you just changed, the same as the terminal. Turn it on or off with the **hints** checkbox. Hints are spaced out: saves that come quickly are combined into one hint, with a 15-second gap by default (`AWAKEN_HINT_COOLDOWN_S`).
+- **Unprompted reports (Lucid and later).** Once you pause editing, it reviews what changed and posts a 🔎 bug card on its own. Each card has a **Fix it** button that switches to Code mode, and every edit still shows a diff for you to approve. After a longer pause it posts feature ideas. In an empty folder, or when you click **Project done?**, it suggests new programs instead.
+  - **Look now** asks for a sweep straight away.
+  - The **proactive** checkbox pauses it.
+  - It keeps the same manners as the terminal: it never interrupts a running task or a pending approval, never repeats a finding, and takes at most 4 looks an hour.
+  - Settings: `AWAKEN_PROACTIVE=off` turns it off. `AWAKEN_PROACTIVE_BUG_MS`, `AWAKEN_PROACTIVE_IDEA_MS` and `AWAKEN_PROACTIVE_PER_HOUR` tune the timing.
+  - Scouting is read-only. It may run your tests only when commands are OS-sandboxed.
 
 It listens on `127.0.0.1` only. Every request needs the random token from the printed link and a matching Host and Origin, so other websites can't drive it, including through DNS rebinding. The page runs under a strict Content Security Policy, and it confines itself like the terminal version. `--shell cloud` runs Code mode in Claude's cloud sandbox.
 

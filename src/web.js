@@ -16,6 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { listFiles, resolveInside, makeToolRunner } from './tools.js';
 import { redactSecrets, containsSecret, isSecretPath } from './security.js';
+import { unifiedDiff, changedLineCount } from './diff.js';
+import { Proactive } from './proactive.js';
 
 const MAX_BODY = 1_000_000;
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -53,6 +55,8 @@ const safeEqual = (a, b) => {
 export function createWebApp({
   projects: initialProjects, stateDir, selfDir, awareness, makeAgent, runCode = null, git = runGit,
   shell = {}, sandboxReport = '', token = randomBytes(18).toString('base64url'), uiHtml, describe = () => '',
+  // Live features (like the terminal): watch(root, onChange) → { close, noteSelfWrite }; scout(mode, msg, root) → text.
+  watch = null, scout = null, hintCooldownMs = 15_000, proactiveConfig = {},
 }) {
   const projects = new Map(); // id -> { id, name, root, kind }
   const addProject = (root, name, kind = 'local') => {
@@ -81,11 +85,60 @@ export function createWebApp({
 
   const agentFor = (p) => (p.agent ??= makeAgent(p.root));
 
+  // ---------- live: save-hints and unprompted reports (same logic as the terminal) ----------
+  let hints = true, watcher = null, lastHintAt = 0, hintTimer = null, queued = null, lastFinding = null;
+  const isFree = () => !job && questions.size === 0;
+  const proactive = scout && awareness ? new Proactive({
+    awareness, isFree, isQuiet: () => false, config: proactiveConfig,
+    listCode: () => (current ? listFiles(current.root, '.', 500) : Promise.resolve([])),
+    show: (kind, text) => { if (kind === 'bugs') lastFinding = text; emit({ type: 'proactive', kind, text }); },
+    scout: (mode, msg) => (current ? scout(mode, msg, current.root) : Promise.resolve('')),
+  }) : null;
+
+  async function hint(change) {
+    const diff = unifiedDiff(change.prev, change.content);
+    if (!diff || changedLineCount(diff) === 0 || !current) return;
+    lastHintAt = Date.now();
+    const id = randomBytes(6).toString('hex');
+    try {
+      const out = await agentFor(current).suggest({ rel: change.rel, diff, content: change.content }, {
+        onStart: () => emit({ type: 'hint', id, rel: change.rel, label: awareness?.genre?.title ?? awareness?.stage?.name ?? '' }),
+        onText: (t) => emit({ type: 'hint-text', id, text: strip(t) }),
+      });
+      if (out !== null) { emit({ type: 'hint-end', id }); awareness?.hinted(change.rel); } else awareness?.note('hintsSilent');
+    } catch (e) { awareness?.note('errors', `hint: ${e.message}`); emit({ type: 'status', text: `hint failed: ${strip(e.message)}` }); }
+  }
+
+  function onSave(change) {
+    awareness?.savedAfter(change.rel);
+    if (awareness) for (const l of awareness.feed('save', change.rel)) emit({ type: 'announce', text: l });
+    emit({ type: 'saved', rel: change.rel });
+    proactive?.onSave(change.rel);
+    if (!hints || job || questions.size) return;
+    const wait = lastHintAt + hintCooldownMs - Date.now();
+    if (wait <= 0) return void hint(change);
+    queued = change; // coalesce saves during the cooldown
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => { const ch = queued; queued = null; if (ch && hints && !job) hint(ch); }, wait);
+    hintTimer.unref?.();
+  }
+
+  async function watchCurrent() {
+    try { watcher?.close(); } catch { /* already closed */ }
+    watcher = null;
+    if (!watch || !current) return;
+    try { watcher = await watch(current.root, onSave); } catch (e) { emit({ type: 'status', text: `Can't watch this folder for saves: ${strip(e.message)}` }); }
+    proactive?.dirty.clear();
+    void proactive?.onStart();
+  }
+
   function stateJson() {
     return {
       projects: [...projects.values()].map(({ id, name, root, kind }) => ({ id, name, root, kind })),
       current: current?.id ?? null,
-      busy: Boolean(job), autoYes,
+      busy: Boolean(job), autoYes, hints,
+      proactive: proactive ? { available: true, enabled: proactive.enabled, awake: proactive.awake, status: proactive.status() } : { available: false },
+      lastFinding: Boolean(lastFinding),
       stage: awareness?.describe?.() ?? '', sandbox: sandboxReport, info: describe(),
     };
   }
@@ -97,7 +150,8 @@ export function createWebApp({
     job = { abort: () => ac.abort(), mode };
     emit({ type: 'start', mode });
     if (awareness) for (const l of awareness.feed(mode === 'code' ? 'code' : 'ask')) emit({ type: 'announce', text: l });
-    const runTool = makeToolRunner({ root: p.root, selfDir, awareness, term: webTerm, autoYes, shell, signal: ac.signal });
+    p.agent?.cancelSuggestion?.();
+    const runTool = makeToolRunner({ root: p.root, selfDir, awareness, term: webTerm, autoYes, shell, signal: ac.signal, onWrite: (rel, content) => watcher?.noteSelfWrite?.(rel, content) });
     try {
       if (mode === 'code' && runCode) await runCode(text, { root: p.root, runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }), onStatus: (s) => emit({ type: 'status', text: strip(s) }) });
       else await agentFor(p).converse(text, { mode: mode === 'code' ? 'code' : 'ask', runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }) });
@@ -122,6 +176,7 @@ export function createWebApp({
       if (r.code !== 0) throw Object.assign(new Error(`git clone failed: ${strip(r.out).trim().split('\n').slice(-3).join(' ')}`), { status: 502 });
     }
     current = addProject(dest, `${gh.owner}/${gh.repo}`, 'github');
+    await watchCurrent();
     return current;
   }
 
@@ -228,7 +283,7 @@ export function createWebApp({
           else {
             const p = projects.get(body.id);
             if (!p) return json(res, 400, { error: 'Unknown project. Local folders must be given when starting the web app (they set the sandbox).' });
-            current = p;
+            if (current !== p) { current = p; await watchCurrent(); }
           }
           emit({ type: 'state', state: stateJson() });
           return json(res, 200, stateJson());
@@ -251,6 +306,34 @@ export function createWebApp({
         }
         case '/api/stop': job?.abort(); answerAll('n'); return json(res, 200, { ok: true });
         case '/api/auto': autoYes = Boolean(body.on); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
+        case '/api/hints': hints = Boolean(body.on); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
+        case '/api/proactive': {
+          if (!proactive) return json(res, 400, { error: 'Proactive mode is not available in this session.' });
+          if (body.action === 'now') {
+            if (!proactive.awake) return json(res, 400, { error: `It looks on its own from the Lucid stage. ${awareness.describe()}` });
+            void (async () => {
+              const found = await proactive.bugSweep({ manual: true });
+              const ideas = await proactive.ideas('idle', { manual: true });
+              if (!found && !ideas) emit({ type: 'status', text: 'Nothing worth interrupting you for right now.' });
+            })();
+            return json(res, 202, { started: true });
+          }
+          if (body.action === 'done') {
+            void proactive.ideas('done', { manual: true }).then((r) => { if (!r) emit({ type: 'status', text: 'No new ideas I haven\'t already given you.' }); });
+            return json(res, 202, { started: true });
+          }
+          proactive.enabled = Boolean(body.on);
+          if (!proactive.enabled) proactive.stop();
+          emit({ type: 'state', state: stateJson() });
+          return json(res, 200, stateJson());
+        }
+        case '/api/fix': {
+          if (!lastFinding) return json(res, 400, { error: 'No unprompted bug report to fix yet.' });
+          if (job) return json(res, 409, { error: 'Busy with the last request; stop it or wait.' });
+          awareness?.note('proactiveFixed');
+          void startMessage(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${lastFinding}`, 'code');
+          return json(res, 202, { started: true });
+        }
         case '/api/clear': if (current?.agent) current.agent.history = []; return json(res, 200, { ok: true });
         case '/api/commit': if (!current) return json(res, 400, { error: 'No project' }); return json(res, 200, await commit(current, body.message));
         case '/api/push': if (!current) return json(res, 400, { error: 'No project' }); return json(res, 200, await push(current));
@@ -261,7 +344,9 @@ export function createWebApp({
     }
   });
 
-  return { server, token, projects, emit, state: stateJson, get autoYes() { return autoYes; } };
+  server.on('listening', () => { void watchCurrent(); });
+  server.on('close', () => { try { watcher?.close(); } catch { /* closed */ } proactive?.stop(); clearTimeout(hintTimer); });
+  return { server, token, projects, emit, state: stateJson, proactive, get autoYes() { return autoYes; } };
 }
 
 // ======================================================================
@@ -324,7 +409,24 @@ async function main() {
       })
     : null;
 
+  const { startWatcher } = await import('./watcher.js');
+  const noProactive = /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTIVE ?? '');
+  const scoutAgents = new Map();
+  const scout = noProactive ? null : async (mode, message, root) => {
+    if (!scoutAgents.has(root)) { const a = makeAgent(root); a.scoutCanRun = Boolean(shell.os); scoutAgents.set(root, a); }
+    const a = scoutAgents.get(root);
+    let text = '';
+    const runTool = makeToolRunner({ root, selfDir, awareness, term: { print() {}, question: async () => 'n' }, interactive: false, shell });
+    try { await a.converse(message, { mode, runTool, onText: (t) => (text += t), maxTurns: 15 }); }
+    catch (e) { awareness.note('errors', `proactive: ${e.message}`); return ''; }
+    finally { a.history = []; }
+    return text;
+  };
+  const num = (v) => (v && Number(v) > 0 ? Number(v) : undefined);
+  const proactiveConfig = Object.fromEntries(Object.entries({ bugIdleMs: num(process.env.AWAKEN_PROACTIVE_BUG_MS), ideaIdleMs: num(process.env.AWAKEN_PROACTIVE_IDEA_MS), maxPerHour: num(process.env.AWAKEN_PROACTIVE_PER_HOUR) }).filter(([, v]) => v));
   const app = createWebApp({
+    watch: (root, onChange) => startWatcher(root, onChange), scout, proactiveConfig,
+    hintCooldownMs: (num(process.env.AWAKEN_HINT_COOLDOWN_S) ?? 15) * 1000,
     projects: roots, stateDir, selfDir, awareness, makeAgent, runCode, shell, sandboxReport,
     uiHtml: fs.readFileSync(path.join(selfDir, 'web-ui.html'), 'utf8'),
     describe: () => `models ${opt.model} / ${opt['fast-model']} · /code runs ${opt.shell === 'cloud' ? "in Claude's cloud sandbox" : 'here'}`,
