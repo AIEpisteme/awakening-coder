@@ -111,7 +111,9 @@ npm run web -- /path/to/project another/project     # or: node src/web.js <folde
 It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
 
 - **Chat** with an **Ask / Code** switch. Answers stream in as they're written. In Code mode it plans, edits and runs tests, the same as `/code`.
-- **Approval cards.** Every edit appears as a colored diff and every command is shown before it runs, each with **Approve** and **Decline** buttons. The rules match the terminal: destructive commands and high-risk files always ask, and the **auto-approve** checkbox works like `/auto`.
+- **Approval cards.** Every edit appears as a colored diff and every command is shown before it runs, each with **Approve** and **Decline** buttons.
+- **Auto-approve.** Tick the checkbox, or type `/auto on`, and edits and commands go ahead without asking. It takes effect immediately, including for a card that's already waiting. Where commands can't be OS-sandboxed (for example on Windows), ticking it also lets ordinary commands such as `npm test` run directly on your computer, and the app tells you so. Destructive commands and high-risk files (`package.json`, hooks, CI, `AWAKEN.md`) still ask.
+- **Slash commands.** Type `/help` in the chat box for the list: `/ask`, `/code`, `/auto`, `/hints`, `/proactive`, `/look`, `/done`, `/fix`, `/stop`, `/clear`, `/status` and `/sandbox`.
 - **Projects.**
   - **Local folders:** the folders you passed when starting it. These set its sandbox.
   - **GitHub repos:** paste a GitHub URL to clone it into `~/.awakening-coder/repos/` and work on it there.

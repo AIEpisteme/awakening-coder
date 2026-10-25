@@ -96,7 +96,7 @@ input.check { width: auto; }
     <label class="row muted" id="proLabel" title="From the Lucid stage: unprompted bug reports after you pause, and ideas"><input type="checkbox" id="pro" class="check" checked> proactive</label>
     <button id="lookNow" title="Look for bugs and ideas right now (Lucid and later)">Look now</button>
     <button id="doneBtn" title="Tell it the project is finished: it suggests new programs to build">Project done?</button>
-    <label class="row muted" title="Answer yes to edit and command prompts this session (destructive commands and high-risk files still ask)"><input type="checkbox" id="auto" class="check"> auto-approve</label>
+    <label class="row muted" title="Approve edits and commands without asking, starting right away (also /auto). Destructive commands and high-risk files still ask."><input type="checkbox" id="auto" class="check"> auto-approve</label>
     <button id="sandboxBtn">Sandbox</button>
   </header>
 
@@ -122,7 +122,7 @@ input.check { width: auto; }
         </div>
         <span class="muted" id="modeHint">Ask questions about the code. Nothing is changed.</span>
       </div>
-      <textarea id="input" placeholder="Ask about the code, or switch to Code and describe what to build or fix…"></textarea>
+      <textarea id="input" placeholder="Ask about the code, or switch to Code and describe what to build or fix… (/help for commands)"></textarea>
       <div class="row">
         <button class="primary" id="send">Send</button>
         <button id="stop" disabled>Stop</button>
@@ -245,7 +245,7 @@ input.check { width: auto; }
         card.append(yes, no); log.append(card); bubble = null; scroll(); yes.focus();
         break;
       }
-      case 'answered': { const card = log.querySelector(`.ask[data-id="${CSS.escape(ev.id)}"]`); if (card) { card.querySelectorAll('button').forEach((b) => b.remove()); card.append(el('span', 'muted', 'answered')); } break; }
+      case 'answered': { const card = log.querySelector(`.ask[data-id="${CSS.escape(ev.id)}"]`); if (card) { card.querySelectorAll('button').forEach((b) => b.remove()); card.append(el('span', 'muted', ev.by === 'auto' ? 'auto-approved' : 'answered')); } break; }
       case 'error': note(ev.text, 'error'); bubble = null; break;
       case 'saved': $('savedLine').textContent = 'saved ' + ev.rel + ' · '; break;
       case 'hint': {
@@ -285,12 +285,72 @@ input.check { width: auto; }
   $('modeAsk').onclick = () => setMode('ask');
   $('modeCode').onclick = () => setMode('code');
 
+  // ---------- slash commands (typed in the chat box, like the terminal) ----------
+  const HELP = [
+    ['/help', 'show these commands'],
+    ['/ask [question]', 'switch to Ask mode (and ask)'],
+    ['/code [task]', 'switch to Code mode (and start the task)'],
+    ['/auto [on|off]', 'approve edits and commands without asking (destructive commands and high-risk files still ask)'],
+    ['/hints [on|off]', 'hint cards when you save a file'],
+    ['/proactive [on|off]', 'unprompted bug reports and ideas (Lucid and later)'],
+    ['/look', 'look for bugs and ideas right now'],
+    ['/done', 'project finished: suggest new programs'],
+    ['/fix', 'fix the last bug it reported on its own'],
+    ['/stop', 'stop the current task'],
+    ['/clear', 'start a new conversation (awareness is kept)'],
+    ['/status', 'awareness stage, settings and models'],
+    ['/sandbox', 'how it is sandboxed'],
+    ['/files, /git', 'refresh the file list or git panel'],
+  ];
+  const onOff = (arg, cur) => (arg === 'on' ? true : arg === 'off' ? false : arg === '' ? !cur : null);
+  const autoNote = (on) => note(on
+    ? 'Auto-approve on: edits and commands go ahead without asking' + (state && !state.osSandbox ? ', and commands run directly on this computer (no OS sandbox here)' : '') + '. Destructive commands and high-risk files (package.json, hooks, CI, AWAKEN.md) still ask. /auto off to stop.'
+    : 'Auto-approve off: I\'ll ask before every change again.');
+  const setAuto = (on) => api('/api/auto', { on }).then((s) => { renderState(s); autoNote(on); }).catch((e) => note(e.message, 'error'));
+
+  async function command(text) {
+    const [, name, rest = ''] = text.match(/^\/(\S+)\s*([\s\S]*)$/) || [];
+    const arg = rest.trim().toLowerCase();
+    const flag = (key, cur, url) => { const v = onOff(arg, cur); if (v === null) return note(`usage: /${name} [on|off]`); return api(url, { on: v }).then((s) => { renderState(s); note(`${name} ${v ? 'on' : 'off'}`); }); };
+    switch ((name || '').toLowerCase()) {
+      case 'help': case '?': {
+        const card = el('div', 'card'); card.append(el('div', 'title', 'Commands'));
+        const pre = el('pre', 'tool', HELP.map(([c, d]) => c.padEnd(22) + d).join('\n'));
+        card.append(pre, el('div', 'muted', 'Anything else you type goes to the coder. Ctrl+Enter sends.'));
+        log.append(card); scroll(); return;
+      }
+      case 'ask': setMode('ask'); return rest.trim() ? sendText(rest.trim()) : note('Ask mode.');
+      case 'code': setMode('code'); return rest.trim() ? sendText(rest.trim()) : note('Code mode: describe what to build or fix.');
+      case 'auto': { const v = onOff(arg, state?.autoYes); return v === null ? note('usage: /auto [on|off]') : setAuto(v); }
+      case 'hints': return flag('hints', state?.hints, '/api/hints');
+      case 'proactive': return arg === 'now' ? $('lookNow').onclick() : flag('proactive', state?.proactive?.enabled, '/api/proactive');
+      case 'look': return $('lookNow').onclick();
+      case 'done': return $('doneBtn').onclick();
+      case 'fix': setMode('code'); return api('/api/fix', {}).catch((e) => note(e.message, 'error'));
+      case 'stop': return $('stop').onclick();
+      case 'clear': case 'new': return $('clear').onclick();
+      case 'sandbox': return $('sandboxBtn').onclick();
+      case 'files': return loadFiles();
+      case 'git': return loadGit();
+      case 'status': case 'self': {
+        const s = state || await api('/api/state');
+        return note([s.stage, `auto-approve ${s.autoYes ? 'on' : 'off'} · hints ${s.hints ? 'on' : 'off'} · proactive ${s.proactive?.available ? s.proactive.status : 'not available'}`, s.info].filter(Boolean).join('\n'));
+      }
+      default: return note(`Unknown command /${name}. Type /help for the list.`, 'error');
+    }
+  }
+
+  async function sendText(text) {
+    log.append(el('div', 'msg you', (mode === 'code' ? '⚙ ' : '') + text)); scroll();
+    try { await api('/api/message', { text, mode }); } catch (e) { note(e.message, 'error'); }
+  }
+
   const send = async () => {
     const text = $('input').value.trim();
     if (!text) return;
-    log.append(el('div', 'msg you', (mode === 'code' ? '⚙ ' : '') + text)); scroll();
+    if (/^\/\S/.test(text)) { $('input').value = ''; log.append(el('div', 'msg you', text)); scroll(); try { await command(text); } catch (e) { note(e.message, 'error'); } return; }
     $('input').value = '';
-    try { await api('/api/message', { text, mode }); } catch (e) { note(e.message, 'error'); }
+    return sendText(text);
   };
   $('send').onclick = send;
   $('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
@@ -300,7 +360,7 @@ input.check { width: auto; }
   $('pro').onchange = (e) => api('/api/proactive', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
   $('lookNow').onclick = () => { note('Looking for bugs and ideas…'); api('/api/proactive', { action: 'now' }).catch((e) => note(e.message, 'error')); };
   $('doneBtn').onclick = () => { note('Finished? Nice. Thinking about what to build next…'); api('/api/proactive', { action: 'done' }).catch((e) => note(e.message, 'error')); };
-  $('auto').onchange = (e) => api('/api/auto', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
+  $('auto').onchange = (e) => setAuto(e.target.checked);
   $('sandboxBtn').onclick = () => { if (state) note(state.sandbox + (state.info ? '\n' + state.info : '')); };
   $('ghForm').onsubmit = (e) => {
     e.preventDefault();

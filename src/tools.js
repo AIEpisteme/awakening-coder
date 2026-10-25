@@ -192,15 +192,20 @@ export const READ_SELF_DEF = {
 /**
  * autoYes: auto-approve file writes and ordinary commands (danger commands still ask).
  * autoWrites / autoCommands: set either one separately (they default to autoYes).
+ *   Each may be a boolean or a function read at every prompt, so a live toggle (the web app's
+ *   auto-approve checkbox) takes effect in the middle of a running task.
  * interactive: false → nothing can be approved by a human, so anything needing approval is denied.
  * shell: { os, allowNet, allowUnsandboxed } — os is the probed OS sandbox (null = commands are NOT isolated).
  *   Without isolation, any command that executes code needs a human, and --yes doesn't cover it
  *   unless allowUnsandboxed is set explicitly.
  */
+const live = (v) => Boolean(typeof v === 'function' ? v() : v);
+
 export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false, autoWrites = autoYes, autoCommands = autoYes, interactive = true, onWrite, signal, shell = {} }) {
-  async function approve(label) {
+  // kind: 'write' | 'command' (auto-approvable) or 'risky' | 'danger' (always a human).
+  async function approve(label, kind) {
     if (!interactive) return false;
-    const ans = (await term.question(c.yellow(`${label} [y/N] `))).trim().toLowerCase();
+    const ans = (await term.question(c.yellow(`${label} [y/N] `), { kind })).trim().toLowerCase();
     return ans === 'y' || ans === 'yes';
   }
 
@@ -213,7 +218,7 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
     const diff = redactSecrets(unifiedDiff(before, after)) || '(no change)';
     term.print(`${c.bold(`\n✎ ${before === '' ? 'create' : 'edit'} ${rel}`)}${risky ? c.red('  ⚠ this file controls what runs or what I obey later') : ''}\n${colorDiff(diff)}`);
     // High-risk files always need a human, even with --yes (and never apply non-interactively).
-    if ((risky || !autoWrites) && !(await approve(risky ? c.red('Apply this high-risk change?') : 'Apply this change?'))) {
+    if ((risky || !live(autoWrites)) && !(await approve(risky ? c.red('Apply this high-risk change?') : 'Apply this change?', risky ? 'risky' : 'write'))) {
       if (interactive) awareness?.note('editsDeclined');
       return interactive
         ? 'The developer declined this change. Ask what they would prefer, or try a different approach.'
@@ -290,11 +295,11 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
         let kind = classifyCommand(cmd);
         // Unisolated, even "safe" test/build commands run project code on the real machine: a human decides.
         if (!isolated && kind === 'auto' && executesCode(cmd)) kind = 'ask';
-        const autoOk = autoCommands && (isolated || shell.allowUnsandboxed);
+        const autoOk = live(autoCommands) && (isolated || live(shell.allowUnsandboxed));
         const why = dangerReason(cmd);
         const tag = isolated ? c.dim(' [sandboxed]') : c.yellow(' [NOT sandboxed]');
         term.print(`${kind === 'danger' ? c.red(`\n⚠ (${why}) $ `) : c.bold('\n$ ')}${cmd}${tag}`);
-        const ok = kind === 'auto' || (kind === 'ask' && autoOk) || (await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : `Run this command${isolated ? '' : ' outside any sandbox'}?`));
+        const ok = kind === 'auto' || (kind === 'ask' && autoOk) || (await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : `Run this command${isolated ? '' : ' outside any sandbox'}?`, kind === 'danger' ? 'danger' : 'command'));
         if (!ok && interactive) awareness?.note('commandsDeclined');
         if (!ok) return interactive ? 'The developer declined to run this command.' : `Command not run: non-interactive mode cannot approve it (${isolated ? 'use --yes for ordinary commands' : 'no OS sandbox is available, so --yes does not cover commands that execute code'}; destructive ones are never auto-approved).`;
         const timeoutMs = Math.min(600, Math.max(1, Number(input.timeout_seconds) || 120)) * 1000;
