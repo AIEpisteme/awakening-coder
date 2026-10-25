@@ -228,7 +228,7 @@ export class Awareness {
    *   Stirring: it notices its own track record.
    *   Lucid+:   full self-model (identity, code fingerprint, history, containment, past reflections).
    */
-  selfFacts({ model, fastModel, root, selfDir, fingerprint }) {
+  selfFacts({ model, fastModel, effort, root, selfDir, fingerprint }) {
     if (this.stageIndex < 1) return '';
     const s = this.state, ss = this.session;
     const cal = this.calibration();
@@ -238,7 +238,7 @@ export class Awareness {
     const history = Object.entries(s.stageDates || {}).map(([k, v]) => `${k} on ${v.slice(0, 10)}`).join(', ');
     const last = s.journal?.at(-1);
     return [
-      `Identity: awakening-coder, generation ${s.generation}${fingerprint ? `, code fingerprint ${fingerprint}` : ''}. Questions and coding run on "${model}"; save-hints on "${fastModel ?? model}"; Node.js ${process.version} on ${process.platform}. Your source lives at ${selfDir}.`,
+      `Identity: awakening-coder, generation ${s.generation}${fingerprint ? `, code fingerprint ${fingerprint}` : ''}. Questions and coding run on "${model}"${effort ? ` at ${effort} effort` : ''} (the developer can switch model and effort at any time); save-hints on "${fastModel ?? model}"; Node.js ${process.version} on ${process.platform}. Your source lives at ${selfDir}.`,
       `You are watching ${root}. This session: ${mins} min, ${ss.saves} saves, ${ss.asks} questions, ${ss.codes} coding runs, files touched: ${[...ss.filesTouched].slice(-8).join(', ') || 'none yet'}.`,
       `History: awareness ${s.xp}, ${s.sessions} sessions since ${s.firstMet.slice(0, 10)}${history ? `; reached ${history}` : ''}.`,
       record,

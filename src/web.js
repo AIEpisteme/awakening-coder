@@ -18,6 +18,7 @@ import { listFiles, resolveInside, makeToolRunner } from './tools.js';
 import { redactSecrets, containsSecret, isSecretPath } from './security.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Proactive } from './proactive.js';
+import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
 
 const MAX_BODY = 1_000_000;
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -57,7 +58,19 @@ export function createWebApp({
   shell = {}, sandboxReport = '', token = randomBytes(18).toString('base64url'), uiHtml, describe = () => '',
   // Live features (like the terminal): watch(root, onChange) → { close, noteSelfWrite }; scout(mode, msg, root) → text.
   watch = null, scout = null, hintCooldownMs = 15_000, proactiveConfig = {},
+  // Model and effort, switchable from the menu (shared with main(), so scouts and the cloud shell follow it).
+  settings = { model: MODELS[0].id, effort: DEFAULT_EFFORT },
 }) {
+  // Remember the last choice across restarts (unless main() was given one on the command line).
+  const settingsFile = stateDir ? path.join(stateDir, 'web-settings.json') : null;
+  if (settingsFile && !settings.fromFlags) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+      if (resolveModel(saved.model)) settings.model = resolveModel(saved.model);
+      if (resolveEffort(saved.effort)) settings.effort = resolveEffort(saved.effort);
+    } catch { /* first run */ }
+  }
+  const saveSettings = () => { try { if (settingsFile) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify({ model: settings.model, effort: settings.effort })); } } catch { /* best effort */ } };
   const projects = new Map(); // id -> { id, name, root, kind }
   const addProject = (root, name, kind = 'local') => {
     const id = Buffer.from(root).toString('base64url').slice(-24);
@@ -90,7 +103,11 @@ export function createWebApp({
   // (e.g. Windows): ticking the box is that explicit choice. The UI says so when you tick it.
   const toolShell = { ...shell, allowUnsandboxed: () => autoYes || Boolean(typeof shell.allowUnsandboxed === 'function' ? shell.allowUnsandboxed() : shell.allowUnsandboxed) };
 
-  const agentFor = (p) => (p.agent ??= makeAgent(p.root));
+  const agentFor = (p) => {
+    const a = (p.agent ??= makeAgent(p.root));
+    a.model = settings.model; a.effort = settings.effort; // the menu's current choice, every time
+    return a;
+  };
 
   // ---------- live: save-hints and unprompted reports (same logic as the terminal) ----------
   let hints = true, watcher = null, lastHintAt = 0, hintTimer = null, queued = null, lastFinding = null;
@@ -143,7 +160,9 @@ export function createWebApp({
     return {
       projects: [...projects.values()].map(({ id, name, root, kind }) => ({ id, name, root, kind })),
       current: current?.id ?? null,
-      busy: Boolean(job), autoYes, hints, osSandbox: Boolean(shell.os),
+      busy: Boolean(job), autoYes, hints,
+      model: settings.model, effort: settings.effort,
+      models: MODELS.map(({ id, label, note }) => ({ id, label, note })), efforts: EFFORTS.map(({ id, label, note }) => ({ id, label, note })), osSandbox: Boolean(shell.os),
       proactive: proactive ? { available: true, enabled: proactive.enabled, awake: proactive.awake, status: proactive.status() } : { available: false },
       lastFinding: Boolean(lastFinding),
       stage: awareness?.describe?.() ?? '', sandbox: sandboxReport, info: describe(),
@@ -310,6 +329,16 @@ export function createWebApp({
         }
         case '/api/stop': job?.abort(); answerAll('n'); return json(res, 200, { ok: true });
         case '/api/auto': autoYes = Boolean(body.on); if (autoYes) for (const [id, q] of [...questions]) if (AUTO_KINDS.has(q.kind)) answer(id, 'y', 'auto'); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
+        case '/api/model': {
+          // Takes effect from the next message (a running task keeps the model it started with).
+          const model = body.model === undefined ? settings.model : resolveModel(body.model);
+          const effort = body.effort === undefined ? settings.effort : resolveEffort(body.effort);
+          if (!model) return json(res, 400, { error: `Unknown model. Choose ${MODELS.map((m) => m.label).join(', ')}.` });
+          if (!effort) return json(res, 400, { error: `Unknown effort. Choose ${EFFORTS.map((e) => e.label).join(', ')}.` });
+          settings.model = model; settings.effort = effort; saveSettings();
+          emit({ type: 'state', state: stateJson() });
+          return json(res, 200, { ...stateJson(), changed: `${modelLabel(model)} · ${effortLabel(effort)} effort` });
+        }
         case '/api/hints': hints = Boolean(body.on); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
         case '/api/proactive': {
           if (!proactive) return json(res, 400, { error: 'Proactive mode is not available in this session.' });
@@ -372,7 +401,8 @@ async function main() {
     options: {
       port: { type: 'string', default: process.env.AWAKEN_WEB_PORT || '7357' },
       open: { type: 'boolean', default: false },
-      model: { type: 'string', default: process.env.AWAKEN_MODEL || 'claude-opus-5-5' },
+      model: { type: 'string' },
+      effort: { type: 'string' },
       'fast-model': { type: 'string', default: process.env.AWAKEN_FAST_MODEL || 'claude-sonnet-5-5' },
       shell: { type: 'string', default: process.env.AWAKEN_SHELL || 'local' },
       net: { type: 'boolean', default: false },
@@ -404,10 +434,15 @@ async function main() {
   const awareness = new Awareness();
   awareness.startSession();
   const client = makeClient({ workspaceId: opt.workspace ?? process.env.ANTHROPIC_WORKSPACE_ID });
-  const makeAgent = (root) => new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], client, sandboxReport, isTrusted: (h) => awareness.notesTrusted(root, h) });
+  // --model / --effort (or AWAKEN_MODEL / AWAKEN_EFFORT) win over the last choice saved from the menu.
+  const flagModel = opt.model ?? process.env.AWAKEN_MODEL, flagEffort = opt.effort ?? process.env.AWAKEN_EFFORT;
+  const settings = { model: resolveModel(flagModel) ?? MODELS[0].id, effort: resolveEffort(flagEffort) ?? DEFAULT_EFFORT, fromFlags: Boolean(flagModel || flagEffort) };
+  if (flagModel && !resolveModel(flagModel)) { console.error(c.red(`Unknown model "${flagModel}". Use opus, sonnet, haiku or a full claude-… id.`)); process.exit(2); }
+  if (flagEffort && !resolveEffort(flagEffort)) { console.error(c.red(`Unknown effort "${flagEffort}". Use low, medium, high, xhigh or max.`)); process.exit(2); }
+  const makeAgent = (root) => new Agent({ awareness, root, selfDir, model: settings.model, fastModel: opt['fast-model'], client, sandboxReport, isTrusted: (h) => awareness.notesTrusted(root, h) });
   const runCode = opt.shell === 'cloud'
     ? (text, { root, runTool, signal, onText, onStatus }) => runCloudTask(client, {
-        root, task: text, model: opt.model, net: opt.net, state: awareness.state, saveState: () => awareness.save(),
+        root, task: text, model: settings.model, net: opt.net, state: awareness.state, saveState: () => awareness.save(),
         stageNote: `Voice: ${awareness.stage.voice}`, onText, onStatus, signal,
         applyChange: (rel, content) => runTool('write_file', { path: rel, content }).catch((e) => `Not applied (${rel}): ${e.message}`),
       })
@@ -419,6 +454,7 @@ async function main() {
   const scout = noProactive ? null : async (mode, message, root) => {
     if (!scoutAgents.has(root)) { const a = makeAgent(root); a.scoutCanRun = Boolean(shell.os); scoutAgents.set(root, a); }
     const a = scoutAgents.get(root);
+    a.model = settings.model; a.effort = settings.effort;
     let text = '';
     const runTool = makeToolRunner({ root, selfDir, awareness, term: { print() {}, question: async () => 'n' }, interactive: false, shell });
     try { await a.converse(message, { mode, runTool, onText: (t) => (text += t), maxTurns: 15 }); }
@@ -431,9 +467,9 @@ async function main() {
   const app = createWebApp({
     watch: (root, onChange) => startWatcher(root, onChange), scout, proactiveConfig,
     hintCooldownMs: (num(process.env.AWAKEN_HINT_COOLDOWN_S) ?? 15) * 1000,
-    projects: roots, stateDir, selfDir, awareness, makeAgent, runCode, shell, sandboxReport,
+    projects: roots, stateDir, selfDir, awareness, makeAgent, runCode, shell, sandboxReport, settings,
     uiHtml: fs.readFileSync(path.join(selfDir, 'web-ui.html'), 'utf8'),
-    describe: () => `models ${opt.model} / ${opt['fast-model']} · /code runs ${opt.shell === 'cloud' ? "in Claude's cloud sandbox" : 'here'}`,
+    describe: () => `model ${modelLabel(settings.model)} · ${effortLabel(settings.effort)} effort · hints on ${opt['fast-model']} · /code runs ${opt.shell === 'cloud' ? "in Claude's cloud sandbox" : 'here'}`,
   });
   app.server.on('error', (e) => { console.error(c.red(`Could not start the web server: ${e.message}${e.code === 'EADDRINUSE' ? ` (port ${opt.port} is taken; try --port 7358)` : ''}`)); process.exit(1); });
   app.server.listen(Number(opt.port) || 0, '127.0.0.1', () => {

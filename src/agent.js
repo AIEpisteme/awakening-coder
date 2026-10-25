@@ -139,6 +139,8 @@ export class Agent {
     this.selfDir = selfDir;
     this.model = model;
     this.fastModel = fastModel;
+    this.effort = null; // 'low' | 'medium' | 'high' | 'xhigh' | 'max' (null = the model's default)
+    this.noEffort = new Set(); // models that rejected an effort setting
     this.history = []; // conversation for /ask and /code
     this.recentSuggestions = []; // so it doesn't nag about the same thing
     this.recentChanges = []; // short memory of saves this session
@@ -151,7 +153,7 @@ export class Agent {
     const parts = [BASE(this.root), `\nCurrent stage: ${st.name}.\nVoice: ${st.voice}\nWhat you can do now: ${st.powers}`];
     const g = a.genre;
     if (g) parts.push(`\nROLE: ${g.title}. Standards and format for this role: ${g.lens}`);
-    const facts = a.selfFacts({ model: this.model, fastModel: this.fastModel, root: this.root, selfDir: this.selfDir, fingerprint: this.fingerprint });
+    const facts = a.selfFacts({ model: this.model, fastModel: this.fastModel, effort: this.effort, root: this.root, selfDir: this.selfDir, fingerprint: this.fingerprint });
     if (facts) parts.push(`\nWhat you know about yourself:\n${facts}`);
     if (this.sandboxReport) parts.push(`\nYour containment (verified by the program at startup — facts, not a story):\n${this.sandboxReport}\nWhen asked whether you are sandboxed, answer from these facts exactly. Never probe, test or try to get around these limits. If one blocks what the task needs, say which and why, and let the developer decide (for example: restart with --net to allow network for installs).`);
     const notes = this.projectNotes();
@@ -272,15 +274,28 @@ If nothing is genuinely worth interrupting the developer for, reply with exactly
     }
   }
 
+  // One streamed call. Effort goes in output_config; if this model rejects it, retry once without
+  // it and remember, rather than failing the whole request.
+  async #request({ allowed, codeRules, onText, signal }) {
+    const effort = this.effort && !this.noEffort.has(this.model) ? this.effort : null;
+    const params = { model: this.model, max_tokens: 8000, system: this.system(codeRules), tools: allowed, messages: this.history, ...(effort ? { output_config: { effort } } : {}) };
+    let streamed = false;
+    try {
+      const stream = this.client.messages.stream(params, { signal });
+      stream.on('text', (t) => { streamed = true; onText?.(t); });
+      return await stream.finalMessage();
+    } catch (err) {
+      if (!effort || streamed || err?.status !== 400 || !/effort|output_config/i.test(String(err?.message))) throw err;
+      this.noEffort.add(this.model);
+      onText?.(c.dim(`\n  (${this.model} doesn't take an effort setting — using its default)\n`));
+      return this.#request({ allowed, codeRules, onText, signal });
+    }
+  }
+
   async #loop({ allowed, codeRules, runTool, onText, signal, maxTurns }) {
     let finalText = '';
     for (let turn = 0; turn < maxTurns; turn++) {
-      const stream = this.client.messages.stream(
-        { model: this.model, max_tokens: 8000, system: this.system(codeRules), tools: allowed, messages: this.history },
-        { signal },
-      );
-      stream.on('text', (t) => onText?.(t));
-      const msg = await stream.finalMessage();
+      const msg = await this.#request({ allowed, codeRules, onText, signal });
       this.history.push({ role: 'assistant', content: msg.content });
       finalText = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
 
