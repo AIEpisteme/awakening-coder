@@ -113,6 +113,10 @@ It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
 - **Chat** with an **Ask / Code** switch. Answers stream in as they're written. In Code mode it plans, edits and runs tests, the same as `/code`.
 - **Approval cards.** Every edit appears as a colored diff and every command is shown before it runs, each with **Approve** and **Decline** buttons.
 - **Auto-approve.** Tick the checkbox, or type `/auto on`, and edits and commands go ahead without asking. It takes effect immediately, including for a card that's already waiting. Where commands can't be OS-sandboxed (for example on Windows), ticking it also lets ordinary commands such as `npm test` run directly on your computer, and the app tells you so. Destructive commands and high-risk files (`package.json`, hooks, CI, `AWAKEN.md`) still ask.
+- **Model and effort menu.** The button in the header (for example **Opus 5.5 · High ▾**) opens a dropdown with two submenus:
+  - **Model:** Opus 5.5, Sonnet 5.5 or Haiku 5.5.
+  - **Effort:** Low, Medium, High, Extra high or Max. The setting is sent to Claude as `output_config.effort`.
+  - The change applies from your next message, and the app remembers it the next time you start it. You can also type `/model sonnet` or `/effort max`, or start with `--model haiku --effort low`. If a model doesn't accept an effort setting, it falls back to that model's default instead of failing.
 - **Slash commands.** Type `/help` in the chat box for the list: `/ask`, `/code`, `/auto`, `/hints`, `/proactive`, `/look`, `/done`, `/fix`, `/stop`, `/clear`, `/status` and `/sandbox`.
 - **Projects.**
   - **Local folders:** the folders you passed when starting it. These set its sandbox.

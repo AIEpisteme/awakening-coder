@@ -19,6 +19,7 @@ import { listFiles } from './tools.js';
 import { relaunchConfined, sandboxStatus, describeSandbox, isFullySandboxed } from './sandbox.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
+import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
 const selfRoot = path.join(selfDir, '..');
@@ -32,6 +33,7 @@ const { values: opt, positionals } = parseArgs({
   options: {
     print: { type: 'string', short: 'p' },
     model: { type: 'string', default: process.env.AWAKEN_MODEL || 'claude-opus-5-5' },
+    effort: { type: 'string', default: process.env.AWAKEN_EFFORT || DEFAULT_EFFORT },
     'fast-model': { type: 'string', default: process.env.AWAKEN_FAST_MODEL || 'claude-sonnet-5-5' },
     cooldown: { type: 'string', default: '15' },
     yes: { type: 'boolean', short: 'y', default: false },
@@ -56,6 +58,7 @@ ${c.bold('awaken')} [project-dir] [options]
 Options
   -p, --print "<task>"  headless: do the task, print the result, exit (like claude -p)
   --model <id>          model for questions and coding   (default claude-opus-5-5)
+  --effort <level>      low | medium | high | xhigh | max  (default high)
   --fast-model <id>     model for on-the-fly hints       (default claude-sonnet-5-5)
   --cooldown <sec>      min seconds between hints        (default 15)
   -y, --yes             auto-approve edits and ordinary commands (destructive commands and
@@ -90,6 +93,8 @@ In-session commands
                       commands, high-risk files, and code-running commands with no OS sandbox
                       still ask); unprompted bug reports are then fixed without asking first
   /done               tell it the project is finished: it suggests new programs to build
+  /model [name]       switch model: opus, sonnet, haiku (Opus 5.5 / Sonnet 5.5 / Haiku 5.5)
+  /effort [level]     switch effort: low, medium, high, xhigh (extra high), max
   /self               its self-model: identity, history, track record, last reflection
   /quiet              toggle on-the-fly hints
   /status             how awake is it?
@@ -182,7 +187,13 @@ const awareness = new Awareness();
 if (opt.forget) awareness.forget();
 let headlessTrust = null;
 const isTrusted = (hash) => awareness.notesTrusted(root, hash) || (headlessTrust !== null && headlessTrust === hash);
+for (const [k, fn, hint] of [['model', resolveModel, 'opus, sonnet, haiku or a full claude-… id'], ['effort', resolveEffort, 'low, medium, high, xhigh or max']]) {
+  const v = fn(opt[k]);
+  if (!v) { console.error(c.red(`Unknown ${k} "${opt[k]}". Use ${hint}.`)); process.exit(2); }
+  opt[k] = v;
+}
 const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client });
+agent.effort = opt.effort;
 
 // ======================================================================
 // Headless mode:  awaken -p "add input validation to src/api.js" .
@@ -402,6 +413,7 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
     scout: async (mode, message) => {
       let text = '';
       const runTool = makeToolRunner({ root, selfDir, awareness, term: silentTerm, interactive: false, shell });
+      scoutAgent.model = opt.model; scoutAgent.effort = opt.effort; // follows /model and /effort
       try { await scoutAgent.converse(message, { mode, runTool, onText: (t) => (text += t), maxTurns: 15 }); }
       catch (e) { awareness.note('errors', `proactive: ${e.message}`); return ''; }
       finally { scoutAgent.history = []; }
@@ -529,7 +541,7 @@ function selfReport() {
   const s = awareness.state;
   const lines = [
     c.magenta(`  ${awareness.describe()}`),
-    `  identity: awakening-coder · generation ${s.generation} · code ${agent.fingerprint ?? 'unknown'} · models ${opt.model} / ${opt['fast-model']}`,
+    `  identity: awakening-coder · generation ${s.generation} · code ${agent.fingerprint ?? 'unknown'} · model ${modelLabel(opt.model)} at ${effortLabel(opt.effort)} effort · hints on ${opt['fast-model']}`,
     `  first met ${s.firstMet.slice(0, 10)} · ${s.sessions} sessions · stages reached: ${Object.entries(s.stageDates || {}).map(([k, v]) => `${k} ${v.slice(0, 10)}`).join(', ') || 'none yet'}`,
     c.bold('\n  track record'), awareness.trackRecord('all').replace(/^/gm, '  '),
   ];
@@ -623,6 +635,14 @@ async function handle(line) {
         ? c.yellow('  /auto on — I\'ll answer yes to edit and command prompts, and fix bugs I report without asking first.') +
           c.dim(`\n  Still asks: destructive commands, high-risk files (package.json, hooks, CI, AWAKEN.md)${shell.os || shell.allowUnsandboxed ? '' : ', and code-running commands (no OS sandbox here)'}. /auto off to stop.`)
         : c.dim('  /auto off — I\'ll ask before every change again.'));
+    case '/model': case '/effort': {
+      const key = cmd.slice(1), list = key === 'model' ? MODELS : EFFORTS, cur = key === 'model' ? opt.model : opt.effort;
+      if (!arg) return term.print(c.dim(`  ${key}: ${(key === 'model' ? modelLabel : effortLabel)(cur)}\n`) + list.map((x) => `  ${x.id === cur ? c.green('✓') : ' '} ${x.label.padEnd(11)} ${c.dim(x.note)}`).join('\n') + c.dim(`\n  usage: /${key} <${list.map((x) => x.aliases?.[0] ?? x.id).join('|')}>`));
+      const v = (key === 'model' ? resolveModel : resolveEffort)(arg);
+      if (!v) return term.print(c.dim(`  Unknown ${key}. Choices: ${list.map((x) => x.label).join(', ')}.`));
+      opt[key] = v; agent[key] = v;
+      return term.print(c.cyan(`  Now using ${modelLabel(opt.model)} · ${effortLabel(opt.effort)} effort.`));
+    }
     case '/done':
       if (!proactive) return term.print(c.dim('  Proactive mode is disabled for this session.'));
       term.print(c.magenta('  ✦ Finished? Nice. Let me think about what\'s next…'));
