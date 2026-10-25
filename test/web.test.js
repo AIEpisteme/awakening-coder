@@ -281,3 +281,59 @@ test('switching to another project closes the old watcher and watches the new on
     assert.match(watchers[1].root, /a__b$/);
   } finally { s.stop(); }
 });
+
+// ---------- auto-approve: live, and only for ordinary edits and commands ----------
+const scriptedAgent = (steps) => () => ({
+  history: [], cancelSuggestion() {}, async suggest() { return null; },
+  async converse(text, { runTool, onText }) { for (const [name, input] of steps) onText(`[${name}] ${await runTool(name, input)}\n`); },
+});
+
+test('ticking auto-approve mid-task approves the waiting edit and the ones after it', async () => {
+  const s = await start({ app: { makeAgent: scriptedAgent([['write_file', { path: 'a.txt', content: 'a\n' }], ['write_file', { path: 'b.txt', content: 'b\n' }]]) } });
+  try {
+    await s.call('/api/message', { body: { text: 'go', mode: 'code' } });
+    const q = await s.waitFor((e) => e.type === 'question');
+    assert.equal(q.kind, 'write');
+    assert.equal((await s.call('/api/auto', { body: { on: true } })).status, 200);
+    const ans = await s.waitFor((e) => e.type === 'answered' && e.id === q.id);
+    assert.equal(ans.by, 'auto');
+    await s.waitFor((e) => e.type === 'done');
+    assert.equal(s.events.filter((e) => e.type === 'question').length, 1, 'b.txt was not asked about');
+    assert.equal(fs.readFileSync(path.join(s.root, 'a.txt'), 'utf8'), 'a\n');
+    assert.equal(fs.readFileSync(path.join(s.root, 'b.txt'), 'utf8'), 'b\n');
+  } finally { s.stop(); }
+});
+
+test('auto-approve runs ordinary commands even without an OS sandbox, but destructive commands and high-risk files still ask', SPAWNS, async () => {
+  const s = await start({ app: { shell: { os: null }, makeAgent: scriptedAgent([
+    ['run_command', { command: 'node mark.js' }],
+    ['write_file', { path: 'package.json', content: '{}\n' }],
+    ['run_command', { command: 'rm -rf build' }],
+  ]) } });
+  try {
+    fs.writeFileSync(path.join(s.root, 'mark.js'), "require('fs').writeFileSync(__dirname + '/ran.txt', '1');\n");
+    await s.call('/api/auto', { body: { on: true } });
+    await s.call('/api/message', { body: { text: 'go', mode: 'code' } });
+    const risky = await s.waitFor((e) => e.type === 'question');
+    assert.equal(risky.kind, 'risky', 'the first prompt is the high-risk file, not the command');
+    assert.ok(fs.existsSync(path.join(s.root, 'ran.txt')), 'the ordinary command ran without asking');
+    await s.call('/api/answer', { body: { id: risky.id, answer: 'n' } });
+    const danger = await s.waitFor((e) => e.type === 'question' && e.id !== risky.id);
+    assert.equal(danger.kind, 'danger');
+    await s.call('/api/answer', { body: { id: danger.id, answer: 'n' } });
+    await s.waitFor((e) => e.type === 'done');
+    assert.ok(!fs.existsSync(path.join(s.root, 'package.json')));
+  } finally { s.stop(); }
+});
+
+test('with auto-approve off, an unsandboxed command still asks', async () => {
+  const s = await start({ app: { shell: { os: null }, makeAgent: scriptedAgent([['run_command', { command: 'npm test' }]]) } });
+  try {
+    await s.call('/api/message', { body: { text: 'go', mode: 'code' } });
+    const q = await s.waitFor((e) => e.type === 'question');
+    assert.equal(q.kind, 'command');
+    assert.match(q.prompt, /outside any sandbox/);
+    await s.call('/api/answer', { body: { id: q.id, answer: 'n' } });
+    await s.waitFor((e) => e.type === 'done');
+  } finally { s.stop(); }
+});

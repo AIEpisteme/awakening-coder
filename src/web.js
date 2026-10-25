@@ -75,13 +75,20 @@ export function createWebApp({
   const emit = (ev) => { const line = `data: ${JSON.stringify(ev)}\n\n`; for (const res of clients) res.write(line); };
   const webTerm = {
     print: (s) => emit({ type: 'print', text: strip(s) }),
-    question: (q) => new Promise((resolve) => {
+    question: (q, { kind = 'other' } = {}) => new Promise((resolve) => {
       const id = randomBytes(8).toString('hex');
-      questions.set(id, resolve);
-      emit({ type: 'question', id, prompt: strip(q) });
+      questions.set(id, { resolve, kind });
+      emit({ type: 'question', id, prompt: strip(q), kind });
     }),
   };
-  const answerAll = (a) => { for (const [id, r] of questions) { questions.delete(id); r(a); emit({ type: 'answered', id }); } };
+  const answer = (id, a, by) => { const q = questions.get(id); if (!q) return false; questions.delete(id); q.resolve(a); emit({ type: 'answered', id, by }); return true; };
+  const answerAll = (a) => { for (const id of [...questions.keys()]) answer(id, a); };
+  // Ordinary edits and commands may be auto-approved; destructive commands and high-risk files never are.
+  const AUTO_KINDS = new Set(['write', 'command']);
+  // Auto-approve is read live, so switching it on mid-task applies to the next prompt, and to the
+  // ones already waiting. With it on, ordinary commands run even where no OS sandbox exists
+  // (e.g. Windows): ticking the box is that explicit choice. The UI says so when you tick it.
+  const toolShell = { ...shell, allowUnsandboxed: () => autoYes || Boolean(typeof shell.allowUnsandboxed === 'function' ? shell.allowUnsandboxed() : shell.allowUnsandboxed) };
 
   const agentFor = (p) => (p.agent ??= makeAgent(p.root));
 
@@ -136,7 +143,7 @@ export function createWebApp({
     return {
       projects: [...projects.values()].map(({ id, name, root, kind }) => ({ id, name, root, kind })),
       current: current?.id ?? null,
-      busy: Boolean(job), autoYes, hints,
+      busy: Boolean(job), autoYes, hints, osSandbox: Boolean(shell.os),
       proactive: proactive ? { available: true, enabled: proactive.enabled, awake: proactive.awake, status: proactive.status() } : { available: false },
       lastFinding: Boolean(lastFinding),
       stage: awareness?.describe?.() ?? '', sandbox: sandboxReport, info: describe(),
@@ -151,7 +158,7 @@ export function createWebApp({
     emit({ type: 'start', mode });
     if (awareness) for (const l of awareness.feed(mode === 'code' ? 'code' : 'ask')) emit({ type: 'announce', text: l });
     p.agent?.cancelSuggestion?.();
-    const runTool = makeToolRunner({ root: p.root, selfDir, awareness, term: webTerm, autoYes, shell, signal: ac.signal, onWrite: (rel, content) => watcher?.noteSelfWrite?.(rel, content) });
+    const runTool = makeToolRunner({ root: p.root, selfDir, awareness, term: webTerm, autoYes: () => autoYes, shell: toolShell, signal: ac.signal, onWrite: (rel, content) => watcher?.noteSelfWrite?.(rel, content) });
     try {
       if (mode === 'code' && runCode) await runCode(text, { root: p.root, runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }), onStatus: (s) => emit({ type: 'status', text: strip(s) }) });
       else await agentFor(p).converse(text, { mode: mode === 'code' ? 'code' : 'ask', runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }) });
@@ -297,15 +304,12 @@ export function createWebApp({
           return json(res, 202, { started: true });
         }
         case '/api/answer': {
-          const r = questions.get(body.id);
-          if (!r) return json(res, 404, { error: 'No such question' });
-          questions.delete(body.id);
-          r(body.answer === 'y' ? 'y' : body.answer === 'unconfined' || body.answer === 'evolve' ? body.answer : 'n');
-          emit({ type: 'answered', id: body.id });
+          const a = body.answer === 'y' ? 'y' : body.answer === 'unconfined' || body.answer === 'evolve' ? body.answer : 'n';
+          if (!answer(body.id, a)) return json(res, 404, { error: 'No such question' });
           return json(res, 200, { ok: true });
         }
         case '/api/stop': job?.abort(); answerAll('n'); return json(res, 200, { ok: true });
-        case '/api/auto': autoYes = Boolean(body.on); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
+        case '/api/auto': autoYes = Boolean(body.on); if (autoYes) for (const [id, q] of [...questions]) if (AUTO_KINDS.has(q.kind)) answer(id, 'y', 'auto'); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
         case '/api/hints': hints = Boolean(body.on); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
         case '/api/proactive': {
           if (!proactive) return json(res, 400, { error: 'Proactive mode is not available in this session.' });
