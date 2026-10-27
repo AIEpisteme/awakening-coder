@@ -62,9 +62,30 @@ export function scrubbedEnv(env = process.env) {
 
 // ---------- shell commands ----------
 const META = /[;&|`$<>]|\n/;
-const SAFE_CMD = /^(git (status|diff|log|show|branch)\b|ls\b|pwd$|node --version$|npm (test|run (test|lint|build|typecheck))\b|node --test\b|npx (tsc|eslint|vitest run|jest|prettier --check)\b|tsc\b)/;
+const SAFE_CMD = /^(ls\b|pwd$|node --version$|npm (test|run (test|lint|build|typecheck))\b|node --test\b|npx (tsc|eslint|vitest run|jest|prettier --check)\b|tsc\b)/;
+
+// "Read-only" git subcommands have options that write files or run programs:
+//   git show/diff/log --output=<file>  writes anywhere (e.g. .git/hooks/pre-commit, run later OUTSIDE any sandbox)
+//   --ext-diff / --textconv            run external programs named in git config
+//   -c / --config-env / --exec-path / --git-dir / --work-tree  change what git trusts
+// (Pillar Security reproduced this class of bypass across several coding agents in July 2026.)
+// So git counts as read-only only in plain forms, and `git branch` only when it lists.
+const GIT_READ = /^git (status|diff|log|show|branch)(\s|$)/;
+const GIT_UNSAFE_ARG = /(^|\s)(--output|--ext-diff|--textconv|--config-env|--exec-path|--git-dir|--work-tree|--upload-pack|--open-files-in-pager|--paginate)(=|\s|$)|(^|\s)(-c|-O\S*)(\s|$)/;
+const GIT_BRANCH_LIST = /^git branch((\s+(-a|-r|-v|-vv|--all|--remotes|--verbose|--list|--show-current|--no-color|--merged|--no-merged|--contains|--sort=\S+|--format=\S+))*)$/;
+
+/** True for git commands that only read repository state (no file writes, no external programs). */
+export function isReadOnlyGit(cmd) {
+  const t = String(cmd).trim();
+  if (!GIT_READ.test(t) || GIT_UNSAFE_ARG.test(t) || META.test(t)) return false;
+  return !/^git branch\b/.test(t) || GIT_BRANCH_LIST.test(t);
+}
 
 const DANGER_RULES = [
+  // Git runs hooks, fsmonitor, pagers and diff/filter drivers OUTSIDE the agent's sandbox, so anything that
+  // plants one is a sandbox escape: writing into .git/hooks|config|info, or setting those config keys.
+  ['tampers with git hooks or config (git would run it later, outside the sandbox)', /(^|[\s='"/\\])\.git[\\/](hooks|config|info|modules)\b|\bcore\.(hooksPath|fsmonitor|pager|editor|sshCommand|gitProxy|askPass)\b|\b(diff|merge|filter)\.[^\s.=]+\.(command|textconv|driver|clean|smudge|process)\b|\bdiff\.external\b|\b(credential|url)\.\S*(helper|insteadOf)\b/i],
+  ['writes files through git', /\bgit\b.*(^|\s)--output(=|\s|$)/],
   ['deletes files', /(^|[\s;&|(])(rm|rmdir|unlink|shred|truncate|srm)\b|\bfind\b.*\s-(delete|exec|execdir|ok)\b/],
   ['rewrites or publishes git history', /\bgit\b.*\b(push|reset|clean|rebase|filter-branch|filter-repo|update-ref|reflog\s+expire|gc\s+--prune|checkout\s+(--|\.)|restore|switch\s+-C|branch\s+-[dD])\b/],
   ['escalates privileges', /(^|[\s;&|(])(sudo|su|doas|pkexec|runas)\b/],
@@ -79,10 +100,10 @@ const DANGER_RULES = [
 ];
 
 // Commands that only read repository/system state and execute no project code.
-const READ_ONLY_CMD = /^(git (status|diff|log|show|branch)\b|ls\b|pwd$|node --version$)/;
+const READ_ONLY_CMD = /^(ls\b|pwd$|node --version$)/;
 
 /** True if the command may execute project code (tests, builds, scripts) — so it needs isolation or a human. */
-export const executesCode = (cmd) => !READ_ONLY_CMD.test(String(cmd).trim());
+export const executesCode = (cmd) => { const t = String(cmd).trim(); return !(READ_ONLY_CMD.test(t) || isReadOnlyGit(t)); };
 
 /**
  * Classify a shell command:
@@ -93,7 +114,7 @@ export const executesCode = (cmd) => !READ_ONLY_CMD.test(String(cmd).trim());
 export function classifyCommand(cmd) {
   const t = String(cmd).trim();
   if (dangerReason(t)) return 'danger';
-  if (SAFE_CMD.test(t) && !META.test(t)) return 'auto';
+  if ((SAFE_CMD.test(t) && !META.test(t)) || isReadOnlyGit(t)) return 'auto';
   return 'ask';
 }
 
@@ -113,6 +134,7 @@ const HIGH_RISK_WRITE = [
   /(^|[\\/])\.(mocharc|babelrc|eslintrc)(\.(js|cjs|json|ya?ml))?$/,
   /(^|[\\/])(jest|vitest)\.setup\.[cm]?[jt]s$/,
   /(^|[\\/])AWAKEN\.md$/, // its own standing instructions
+  /(^|[\\/])\.(gitattributes|gitmodules)$/, // filter/diff drivers and submodule URLs that git acts on
 ];
 
 /** Writes that change what later commands execute, or what the agent obeys, always need a human. */
