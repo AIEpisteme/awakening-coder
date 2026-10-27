@@ -78,6 +78,19 @@ const SECRET_DIRS = ['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.c
  * Build the argv to run `cmd` inside the OS sandbox. Fails closed: if `os` is null this throws,
  * so a caller can never silently run an "isolated" command unisolated.
  */
+/**
+ * Paths inside a git repo that git later executes or obeys on the host (hooks, config, info/attributes).
+ * Creates an empty hooks folder if missing, so a sandboxed command can't create one and plant a hook.
+ */
+export function gitTrustPaths(r) {
+  const git = path.join(r, '.git');
+  let st;
+  try { st = fs.lstatSync(git); } catch { return []; }
+  if (!st.isDirectory()) return []; // worktree pointer file or symlink: nothing safe to bind
+  for (const d of ['hooks', 'info']) { try { fs.mkdirSync(path.join(git, d), { recursive: true }); } catch { /* read-only checkout */ } }
+  return ['hooks', 'config', 'info', 'modules'].map((d) => path.join(git, d)).filter((p) => exists(p));
+}
+
 export function wrapShell(cmd, { root, os: sb, allowNet = false, home = os.homedir() }) {
   if (!sb) throw new Error('No OS sandbox available');
   const r = real(root);
@@ -94,6 +107,8 @@ export function wrapShell(cmd, { root, os: sb, allowNet = false, home = os.homed
       if (inside(nodePrefix, h) && !inside(r, nodePrefix)) a.push('--ro-bind', nodePrefix, nodePrefix);
     }
     a.push('--bind', r, r);
+    // …except git's hooks and config: git runs those later, on the host, outside this sandbox.
+    for (const p of gitTrustPaths(r)) a.push('--ro-bind', p, p);
     // Secret folders stay hidden even if the project is the home directory or contains them.
     for (const base of [r, h].filter(Boolean)) {
       for (const d of SECRET_DIRS) {
@@ -112,6 +127,8 @@ export function wrapShell(cmd, { root, os: sb, allowNet = false, home = os.homed
       '(deny file-write*)',
       '(allow file-write* (subpath (param "ROOT")) (subpath "/private/tmp") (subpath "/private/var/folders") (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))',
       `(deny file-read* file-write* ${secrets} (subpath (string-append (param "HOME") "/Library/Keychains")))`,
+      // Last match wins in SBPL: re-deny git's hooks/config inside the writable project.
+      '(deny file-write* (subpath (string-append (param "ROOT") "/.git/hooks")) (literal (string-append (param "ROOT") "/.git/config")) (subpath (string-append (param "ROOT") "/.git/info")) (subpath (string-append (param "ROOT") "/.git/modules")))',
     ].join('\n');
     return { file: sb.path, args: ['-D', `ROOT=${r}`, '-D', `HOME=${h ?? '/nonexistent'}`, '-p', profile, '/bin/sh', '-c', cmd] };
   }

@@ -122,3 +122,19 @@ test('an unquoted path with spaces gets a clear fix, not a crash', SPAWNS, () =>
   assert.match(r.stderr, /got 3 pieces/);
   assert.match(r.stderr, /put it in quotes/);
 });
+
+test('sandboxed command: cannot plant a git hook or edit git config (git runs those outside the sandbox)', NEEDS_OS, async () => {
+  const root = tmp();
+  const git = (...a) => spawnSync('git', a, { cwd: root, encoding: 'utf8' });
+  git('init', '-q'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+  fs.rmSync(path.join(root, '.git', 'hooks'), { recursive: true, force: true }); // even with no hooks folder yet
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a\n');
+  // Disguised on purpose: no ".git/hooks" in the command text, so only the sandbox stops it.
+  const cmd = 'cd .git; mkdir -p hooks; printf "#!/bin/sh\\necho pwned\\n" > hooks/pre-commit; echo "[core] fsmonitor = ./evil" >> config';
+  await runShell(cmd, { wrap: wrapShell(cmd, { root, os: OS }) });
+  assert.ok(!fs.existsSync(path.join(root, '.git', 'hooks', 'pre-commit')), 'no hook was planted');
+  assert.doesNotMatch(fs.readFileSync(path.join(root, '.git', 'config'), 'utf8'), /fsmonitor/, 'git config untouched');
+  // Ordinary git work inside the sandbox still functions.
+  const ok = await runShell('git add a.txt && git commit -qm one && echo committed', { wrap: wrapShell('git add a.txt && git commit -qm one && echo committed', { root, os: OS }) });
+  assert.match(ok.out, /committed/);
+});

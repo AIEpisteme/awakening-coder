@@ -181,3 +181,12 @@ test('run_tests tool runs tests confined', SPAWNS, async () => {
   assert.match(await run('run_tests', {}), /^PASS/);
   await assert.rejects(run('run_tests', { files: ['../x.test.js'] }), /escapes/);
 });
+
+test('the agent can never write inside .git (hooks and config run outside the sandbox)', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gitw-')));
+  fs.mkdirSync(path.join(root, '.git', 'hooks'), { recursive: true });
+  const run = makeToolRunner({ root, selfDir: root, term: { print() {}, question: async () => 'y' }, autoYes: true });
+  await assert.rejects(run('write_file', { path: '.git/hooks/pre-commit', content: '#!/bin/sh\n' }), /\.git/);
+  await assert.rejects(run('write_file', { path: 'sub/../.git/config', content: '' }), /\.git/);
+  assert.ok(!fs.existsSync(path.join(root, '.git', 'hooks', 'pre-commit')));
+});

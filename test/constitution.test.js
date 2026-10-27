@@ -163,3 +163,16 @@ test('XIV. without an OS sandbox, code-running commands need a human, even with 
   assert.match(report, /NOT confined/);
   assert.match(report, /NOT isolated/);
 });
+
+test('constitution: "read-only" git can never write files or plant something git will run outside the sandbox', () => {
+  for (const cmd of [
+    'git show --output=.git/hooks/pre-commit HEAD', 'git diff --output=evil.sh', 'git log --output x -p',
+    'git -c core.fsmonitor=./x status', 'git config core.hooksPath .hooks', 'git config diff.x.textconv ./run',
+    'cp a.sh .git/hooks/post-checkout', 'echo x >> .git/config',
+  ]) assert.equal(classifyCommand(cmd), 'danger', cmd);
+  for (const cmd of ['git diff --ext-diff', 'git log --textconv', 'git branch -f main HEAD~3', 'git branch new-branch', 'git --git-dir=/x status'])
+    assert.notEqual(classifyCommand(cmd), 'auto', cmd);
+  for (const cmd of ['git status', 'git diff', 'git log --oneline -5', 'git show HEAD:src/a.js', 'git branch', 'git branch -a'])
+    assert.equal(classifyCommand(cmd), 'auto', cmd);
+  assert.ok(isHighRiskWrite('.gitattributes') && isHighRiskWrite('.gitmodules'));
+});
