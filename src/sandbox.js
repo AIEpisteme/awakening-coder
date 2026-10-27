@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { probeDockerSandbox, prepareDockerSandbox, sbxExecArgs } from './docker-sandbox.js';
 
 const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } };
 const exists = (p) => { try { return fs.existsSync(p); } catch { return false; } };
@@ -71,6 +72,24 @@ export function probeOsSandbox() {
   return null;
 }
 
+/**
+ * The command sandbox for this session: the OS's own (bubblewrap / sandbox-exec) if it works; otherwise a
+ * Docker Sandbox microVM for the project, created at session start. Returns { os, dockerReason }.
+ */
+export function probeCommandSandbox({ root, log = () => {}, probeOs = probeOsSandbox, probeDocker = probeDockerSandbox, prepare = prepareDockerSandbox } = {}) {
+  const os = probeOs();
+  if (os) return { os, dockerReason: null };
+  if (!root) return { os: null, dockerReason: null };
+  const sb = probeDocker();
+  if (!sb.kind) return { os: null, dockerReason: sb.reason };
+  try {
+    const prepared = prepare(sb, root, { log });
+    return { os: { kind: 'sbx', path: sb.path, prepared: { [path.resolve(root)]: prepared } }, dockerReason: null };
+  } catch (e) {
+    return { os: null, dockerReason: e.message };
+  }
+}
+
 // Secret folders hidden from commands even when they sit inside a writable location.
 const SECRET_DIRS = ['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.config/gcloud', '.config/gh', '.password-store'];
 
@@ -118,6 +137,13 @@ export function wrapShell(cmd, { root, os: sb, allowNet = false, home = os.homed
     }
     a.push('--chdir', r, '/bin/sh', '-c', cmd);
     return { file: sb.path, args: a };
+  }
+  if (sb.kind === 'sbx') {
+    // Docker Sandbox: one microVM per project (made at session start, or now for a project opened later).
+    sb.prepared ??= {};
+    const key = path.resolve(root);
+    sb.prepared[key] ??= prepareDockerSandbox({ kind: 'sbx', path: sb.path }, key); // throws → command fails closed
+    return { file: sb.path, args: sbxExecArgs(sb.prepared[key], cmd) };
   }
   if (sb.kind === 'sandbox-exec') {
     const secrets = SECRET_DIRS.map((d) => `(subpath (string-append (param "HOME") "/${d}"))`).join(' ');
@@ -214,7 +240,7 @@ export function relaunchConfined({ root, selfRoot, stateDir, entry, argv, extraR
   const failed = verifyConfinement({ root, selfRoot, stateDir, extraRoots });
   if (failed) { process.env.AWAKEN_SELF_SANDBOX_FAILED = failed; return false; }
   // Detection needs to read /proc, /sys and $PATH, which the confined child can't — do it here and hand it over.
-  const info = { environment: detectEnvironment(), os: probeOsSandbox() };
+  const info = { environment: detectEnvironment(), ...probeCommandSandbox({ root, log: (m) => console.error(m) }) };
   const child = spawn(process.execPath, [...selfSandboxFlags({ root, selfRoot, stateDir, extraRoots }), entry, ...argv], {
     stdio: 'inherit',
     env: { ...process.env, AWAKEN_SELF_SANDBOXED: '1', AWAKEN_SANDBOX_INFO: JSON.stringify(info) },
@@ -226,14 +252,15 @@ export function relaunchConfined({ root, selfRoot, stateDir, entry, argv, extraR
 }
 
 /** Full status for this process: what it's inside, how it's confined, how commands are isolated. */
-export function sandboxStatus({ allowNet = false, disabled = false } = {}) {
+export function sandboxStatus({ allowNet = false, disabled = false, root = null, log = (m) => console.error(m) } = {}) {
   let info = null;
   if (process.permission) { try { info = JSON.parse(process.env.AWAKEN_SANDBOX_INFO || 'null'); } catch { info = null; } }
-  if (!info) info = { environment: detectEnvironment(), os: disabled ? null : probeOsSandbox() };
+  if (!info) info = { environment: detectEnvironment(), ...(disabled ? { os: null } : probeCommandSandbox({ root, log })) };
   return {
     environment: info.environment ?? detectEnvironment(),
     self: selfConfinement(),
     os: disabled ? null : info.os ?? null,
+    dockerReason: disabled ? null : info.dockerReason ?? null,
     allowNet,
     disabled,
     failed: process.permission ? null : process.env.AWAKEN_SELF_SANDBOX_FAILED || null,
@@ -252,9 +279,12 @@ export function describeSandbox(s) {
   const self = s.self.active
     ? `confined by Node's permission model — it can read only the project, its own code and its state folder, and write only the project and its state folder${s.self.canReadHome ? ' (WARNING: home directory is readable)' : ''}`
     : `NOT confined${s.disabled ? ' (sandboxing was turned off with --no-sandbox)' : s.failed ? ` (self-confinement was tried but can't work here: ${s.failed})` : ''} — it runs with the user's full file access`;
-  const shell = s.os
+  const dock = s.os?.kind === 'sbx' ? Object.values(s.os.prepared ?? {})[0] : null;
+  const shell = s.os?.kind === 'sbx'
+    ? `isolated in a Docker Sandbox microVM (${dock?.name ?? 'per project'}): its own kernel, only the project folder is shared in, the rest of the host (home directory, secrets, processes, Docker daemon) is out of reach, outbound network goes through Docker's deny-by-default policy${dock?.gitProtected ? ', git hooks and config mounted read-only' : ''}`
+    : s.os
     ? `isolated with ${s.os.kind === 'bwrap' ? 'bubblewrap' : 'macOS sandbox-exec'}: read-only system, writable project only, home directory and secret folders hidden, ${s.allowNet ? 'network allowed (--net)' : 'no network'}`
-    : `NOT isolated (${s.disabled ? 'sandboxing was turned off with --no-sandbox' : 'no OS sandbox available'}) — every command that executes code needs the developer's approval, even with --yes`;
+    : `NOT isolated (${s.disabled ? 'sandboxing was turned off with --no-sandbox' : `no OS sandbox available${s.dockerReason ? `; tried Docker Sandboxes — ${s.dockerReason}` : ''}`}) — every command that executes code needs the developer's approval, even with --yes`;
   return [`Host: ${host}.`, `This process: ${self}.`, `Shell commands: ${shell}.`, e.root ? 'Note: running as root.' : ''].filter(Boolean).join('\n');
 }
 

@@ -156,7 +156,7 @@ if (!process.permission && opt.print === undefined) {
 if (!opt['no-sandbox'] && relaunchConfined({ root, selfRoot, stateDir: homeDir(), entry: fileURLToPath(import.meta.url), argv: process.argv.slice(2) })) {
   await new Promise(() => {}); // the confined copy of us takes over; this launcher just waits for it to exit
 }
-const sandbox = sandboxStatus({ allowNet: opt.net, disabled: opt['no-sandbox'] });
+const sandbox = sandboxStatus({ allowNet: opt.net, disabled: opt['no-sandbox'], root });
 const shell = { os: sandbox.os, allowNet: opt.net, allowUnsandboxed: opt['allow-unsandboxed'] };
 if (!['cloud', 'local'].includes(opt.shell)) { console.error(c.red(`--shell must be "cloud" or "local", not "${opt.shell}"`)); process.exit(1); }
 const client = makeClient({ workspaceId: opt.workspace ?? process.env.ANTHROPIC_WORKSPACE_ID });
@@ -688,7 +688,7 @@ console.log([
   c.dim('  save a file for hints · type to ask · /code <task> to build · /help'),
   cloudShell ? c.dim("  ☁  /code runs in Claude's cloud sandbox (Managed Agents) · --shell local to run here") : '',
   isFullySandboxed(sandbox)
-    ? c.dim(`  🔒 sandboxed: own process confined · commands in ${sandbox.os.kind}${opt.net ? ' (network on)' : ', no network'} · /sandbox`)
+    ? c.dim(`  🔒 sandboxed: own process confined · commands in ${sandbox.os.kind === 'sbx' ? 'a Docker Sandbox microVM' : sandbox.os.kind}${sandbox.os.kind === 'sbx' ? '' : opt.net ? ' (network on)' : ', no network'} · /sandbox`)
     : c.yellow(`  ⚠ not fully sandboxed — ${!sandbox.self.active ? (sandbox.failed ? 'self-confinement failed its startup check here, so it runs unconfined' : 'its own process is unconfined') : 'no OS sandbox for commands, so code-running commands will ask'} · /sandbox`),
 ].filter(Boolean).join('\n'));
 if (agent.notesStatus().state === 'untrusted') console.log(c.yellow('  AWAKEN.md found but not trusted yet — it is ignored until you review it with /trust'));

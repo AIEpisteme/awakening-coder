@@ -427,7 +427,7 @@ async function main() {
   if (!opt['no-sandbox'] && relaunchConfined({ root: roots[0], extraRoots: roots.slice(1), selfRoot, stateDir, entry: fileURLToPath(import.meta.url), argv: process.argv.slice(2) })) {
     await new Promise(() => {});
   }
-  const sandbox = sandboxStatus({ allowNet: opt.net, disabled: opt['no-sandbox'] });
+  const sandbox = sandboxStatus({ allowNet: opt.net, disabled: opt['no-sandbox'], root: roots[0] });
   const shell = { os: sandbox.os, allowNet: opt.net };
   const sandboxReport = describeSandbox(sandbox);
 

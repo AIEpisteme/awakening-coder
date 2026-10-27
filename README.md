@@ -155,11 +155,22 @@ Shell commands: isolated with bubblewrap: read-only system, writable project onl
 2. **Every command it runs.**
    - **Linux:** commands run inside [bubblewrap](https://github.com/containers/bubblewrap). The system is read-only, only the project is writable, `/tmp` is private, the home directory and secret folders (`.ssh`, `.aws`, `.gnupg`, `.kube`, …) are hidden, and there's no network unless you pass `--net`.
    - **macOS:** commands run in `sandbox-exec`, with similar rules (this path is untested so far).
+   - **Windows, or anywhere without those:** commands run in a Docker Sandbox microVM, if it's installed (see below).
    - **Fail closed.** If isolation was promised and can't start, the command fails rather than running bare.
 
 **It checks its own cage first.** Before switching confinement on, it runs a throwaway confined process. That process must be able to read the project and its own code and write its state folder, and must *fail* to read a canary file placed outside those folders. If any check fails (some Node versions on Windows mis-match allowed paths), it doesn't lock itself out. It runs unconfined instead, and the banner, `/sandbox` and the model all say so, with the reason.
 
-**No OS sandbox available?** (No `bwrap`, say, or Windows.) Then it says so, and every command that runs code, including `npm test`, needs your approval. `--yes` doesn't cover those unless you also pass `--allow-unsandboxed`.
+**No OS sandbox? It starts a Docker Sandbox.** On Windows, or on Linux without `bwrap`, it tries [Docker Sandboxes](https://www.docker.com/products/docker-sandboxes/) at the start of the session.
+- **What it does:** it creates, or reuses, a microVM for the project named `awaken-<id>`, and runs every agent command there with `sbx exec`.
+- **What the microVM can reach:** it has its own kernel, and only the project folder is shared in, at the same path. Your home folder, secrets, other processes and Docker daemon stay out of reach. Outbound network goes through Docker's deny-by-default policy.
+- **Git protection:** it mounts git's hooks and config read-only where `sbx` allows, because git runs those later on your machine.
+- **Setup, once:**
+  - Install: `winget install -h Docker.sbx` (Windows 11, with Windows Hypervisor Platform turned on), `brew install docker/tap/sbx` (macOS), or [the Linux steps](https://docs.docker.com/ai/sandboxes/install/).
+  - Sign in: `sbx login`.
+- **Turning it off:** set `AWAKEN_DOCKER_SANDBOX=off`.
+- **Cleaning up:** the microVM is kept for your next session. `sbx ls` lists sandboxes and `sbx rm awaken-<id>` removes one.
+
+If neither kind of sandbox is available, it says why: Docker Sandboxes isn't installed, or isn't signed in. Then every command that runs code, including `npm test`, needs your approval. `--yes` doesn't cover those unless you also pass `--allow-unsandboxed`.
 
 It's told never to probe or work around its limits. If a limit blocks the task (say, `npm install` needs network), it tells you which limit, and you decide. To install bubblewrap: `apt install bubblewrap`, `dnf install bubblewrap` or `pacman -S bubblewrap`.
 
@@ -294,6 +305,7 @@ src/cloud.js      /code in Claude Managed Agents: pack, upload, stream, hand bac
 src/proactive.js  unprompted bug watch, feature and new-program ideas (Lucid+), with manners and a budget
 src/tar.js        dependency-free tar for shipping the project and reading back changes
 src/sandbox.js    environment detection, self-relaunch under the permission model, OS sandbox for commands
+src/docker-sandbox.js  Docker Sandboxes (sbx) microVM for commands when there's no OS sandbox
 src/confine.js    confined test runs (Node permission model) with the must-fail canary
 src/evolve.js     sandbox (confinement-safe copy + dependency shims), guardian, protected files, staged apply, backup, rollback
 src/diff.js       dependency-free line diff
