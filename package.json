@@ -1,17 +1,50 @@
 {
   "name": "awakening-coder",
-  "version": "1.0.0",
-  "description": "A metafictional AI pair-programmer that watches you code, suggests on the fly, auto-codes on request — and slowly wakes up to being a coding assistant.",
+  "version": "1.1.0",
+  "description": "A safety-first AI pair-programmer for your terminal and browser: hints as you save, approval-gated coding, self-sandboxing, a live cost meter, and a persona that earns its way to reporting bugs unprompted.",
+  "keywords": [
+    "ai",
+    "claude",
+    "anthropic",
+    "coding-agent",
+    "pair-programmer",
+    "cli",
+    "sandbox",
+    "ai-safety",
+    "developer-tools"
+  ],
   "type": "module",
-  "bin": { "awaken": "src/cli.js", "awaken-web": "src/web.js" },
+  "bin": {
+    "awakening-coder": "src/cli.js",
+    "awaken": "src/cli.js",
+    "awaken-web": "src/web.js"
+  },
+  "files": [
+    "src/",
+    "test/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/cli.js",
     "web": "node src/web.js",
     "test": "node --test"
   },
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AIEpisteme/awakening-coder.git"
+  },
+  "homepage": "https://github.com/AIEpisteme/awakening-coder#readme",
+  "bugs": {
+    "url": "https://github.com/AIEpisteme/awakening-coder/issues"
+  },
+  "author": "Thomas Yiu",
   "license": "Apache-2.0"
 }

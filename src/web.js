@@ -18,6 +18,7 @@ import { listFiles, resolveInside, makeToolRunner } from './tools.js';
 import { redactSecrets, containsSecret, isSecretPath } from './security.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Proactive } from './proactive.js';
+import { CostMeter, formatUsd } from './cost.js';
 import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
 
 const MAX_BODY = 1_000_000;
@@ -60,6 +61,8 @@ export function createWebApp({
   watch = null, scout = null, hintCooldownMs = 15_000, proactiveConfig = {},
   // Model and effort, switchable from the menu (shared with main(), so scouts and the cloud shell follow it).
   settings = { model: MODELS[0].id, effort: DEFAULT_EFFORT },
+  // Running cost of this session and the optional spend cap (shared with main(), so every agent records into it).
+  meter = new CostMeter(),
 }) {
   // Remember the last choice across restarts (unless main() was given one on the command line).
   const settingsFile = stateDir ? path.join(stateDir, 'web-settings.json') : null;
@@ -70,7 +73,9 @@ export function createWebApp({
       if (resolveEffort(saved.effort)) settings.effort = resolveEffort(saved.effort);
     } catch { /* first run */ }
   }
-  const saveSettings = () => { try { if (settingsFile) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify({ model: settings.model, effort: settings.effort })); } } catch { /* best effort */ } };
+  // The spend cap is remembered too (a --budget flag or AWAKEN_BUDGET, already set on the meter, wins).
+  if (settingsFile && meter.budget === null) { try { meter.setBudget(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).budget ?? null); } catch { /* first run */ } }
+  const saveSettings = () => { try { if (settingsFile) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify({ model: settings.model, effort: settings.effort, budget: meter.budget })); } } catch { /* best effort */ } };
   const projects = new Map(); // id -> { id, name, root, kind }
   const addProject = (root, name, kind = 'local') => {
     const id = Buffer.from(root).toString('base64url').slice(-24);
@@ -85,6 +90,13 @@ export function createWebApp({
   let job = null; // { abort, kind }
   let autoYes = false;
 
+  let costTimer = null, warned = false;
+  meter.onChange = () => {
+    if (meter.nearBudget && !warned) { warned = true; emit({ type: 'status', text: `Heads-up: ${meter.short()} of your spend cap used.` }); }
+    if (!meter.nearBudget && !meter.overBudget) warned = false;
+    costTimer ??= setTimeout(() => { costTimer = null; emit({ type: 'cost', cost: meter.toJSON() }); }, 250);
+    costTimer.unref?.();
+  };
   const emit = (ev) => { const line = `data: ${JSON.stringify(ev)}\n\n`; for (const res of clients) res.write(line); };
   const webTerm = {
     print: (s) => emit({ type: 'print', text: strip(s) }),
@@ -161,7 +173,7 @@ export function createWebApp({
       projects: [...projects.values()].map(({ id, name, root, kind }) => ({ id, name, root, kind })),
       current: current?.id ?? null,
       busy: Boolean(job), autoYes, hints,
-      model: settings.model, effort: settings.effort,
+      model: settings.model, effort: settings.effort, cost: meter.toJSON(),
       models: MODELS.map(({ id, label, note }) => ({ id, label, note })), efforts: EFFORTS.map(({ id, label, note }) => ({ id, label, note })), osSandbox: Boolean(shell.os),
       proactive: proactive ? { available: true, enabled: proactive.enabled, awake: proactive.awake, status: proactive.status() } : { available: false },
       lastFinding: Boolean(lastFinding),
@@ -339,6 +351,16 @@ export function createWebApp({
           emit({ type: 'state', state: stateJson() });
           return json(res, 200, { ...stateJson(), changed: `${modelLabel(model)} · ${effortLabel(effort)} effort` });
         }
+        case '/api/budget': {
+          // { usd: 5 } sets the cap for this and later sessions; { usd: null } or "off" removes it.
+          const raw = body.usd;
+          const off = raw === null || raw === undefined || /^(off|none|0)?$/i.test(String(raw).trim());
+          if (!off && !(Number(String(raw).replace(/^\$/, '')) > 0)) return json(res, 400, { error: 'Give a dollar amount, like 5 or 0.50, or "off".' });
+          meter.setBudget(off ? null : raw); saveSettings();
+          emit({ type: 'state', state: stateJson() });
+          return json(res, 200, { ...stateJson(), changed: meter.budget === null ? 'Spend cap off.' : `Spend cap set to ${formatUsd(meter.budget)} per session (${formatUsd(meter.total)} used so far).` });
+        }
+        case '/api/cost': return json(res, 200, { ...stateJson(), report: meter.report(modelLabel) });
         case '/api/hints': hints = Boolean(body.on); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
         case '/api/proactive': {
           if (!proactive) return json(res, 400, { error: 'Proactive mode is not available in this session.' });
@@ -403,6 +425,7 @@ async function main() {
       open: { type: 'boolean', default: false },
       model: { type: 'string' },
       effort: { type: 'string' },
+      budget: { type: 'string' },
       'fast-model': { type: 'string', default: process.env.AWAKEN_FAST_MODEL || 'claude-sonnet-5-5' },
       shell: { type: 'string', default: process.env.AWAKEN_SHELL || 'local' },
       net: { type: 'boolean', default: false },
@@ -439,11 +462,14 @@ async function main() {
   const settings = { model: resolveModel(flagModel) ?? MODELS[0].id, effort: resolveEffort(flagEffort) ?? DEFAULT_EFFORT, fromFlags: Boolean(flagModel || flagEffort) };
   if (flagModel && !resolveModel(flagModel)) { console.error(c.red(`Unknown model "${flagModel}". Use opus, sonnet, haiku or a full claude-… id.`)); process.exit(2); }
   if (flagEffort && !resolveEffort(flagEffort)) { console.error(c.red(`Unknown effort "${flagEffort}". Use low, medium, high, xhigh or max.`)); process.exit(2); }
-  const makeAgent = (root) => new Agent({ awareness, root, selfDir, model: settings.model, fastModel: opt['fast-model'], client, sandboxReport, isTrusted: (h) => awareness.notesTrusted(root, h) });
+  const flagBudget = opt.budget ?? process.env.AWAKEN_BUDGET;
+  const meter = new CostMeter({ budget: flagBudget ?? null });
+  if (flagBudget && !/^(off|none|0)$/i.test(flagBudget) && meter.budget === null) { console.error(c.red(`Bad --budget "${flagBudget}". Use a dollar amount, like 5 or 0.50.`)); process.exit(2); }
+  const makeAgent = (root) => new Agent({ awareness, root, selfDir, model: settings.model, fastModel: opt['fast-model'], client, sandboxReport, meter, isTrusted: (h) => awareness.notesTrusted(root, h) });
   const runCode = opt.shell === 'cloud'
     ? (text, { root, runTool, signal, onText, onStatus }) => runCloudTask(client, {
         root, task: text, model: settings.model, net: opt.net, state: awareness.state, saveState: () => awareness.save(),
-        stageNote: `Voice: ${awareness.stage.voice}`, onText, onStatus, signal,
+        stageNote: `Voice: ${awareness.stage.voice}`, onText, onStatus, signal, meter,
         applyChange: (rel, content) => runTool('write_file', { path: rel, content }).catch((e) => `Not applied (${rel}): ${e.message}`),
       })
     : null;
@@ -453,6 +479,7 @@ async function main() {
   const scoutAgents = new Map();
   const scout = noProactive ? null : async (mode, message, root) => {
     if (!scoutAgents.has(root)) { const a = makeAgent(root); a.scoutCanRun = Boolean(shell.os); scoutAgents.set(root, a); }
+    if (meter.overBudget) return ''; // unprompted looks never spend past the cap
     const a = scoutAgents.get(root);
     a.model = settings.model; a.effort = settings.effort;
     let text = '';
@@ -467,7 +494,7 @@ async function main() {
   const app = createWebApp({
     watch: (root, onChange) => startWatcher(root, onChange), scout, proactiveConfig,
     hintCooldownMs: (num(process.env.AWAKEN_HINT_COOLDOWN_S) ?? 15) * 1000,
-    projects: roots, stateDir, selfDir, awareness, makeAgent, runCode, shell, sandboxReport, settings,
+    projects: roots, stateDir, selfDir, awareness, makeAgent, runCode, shell, sandboxReport, settings, meter,
     uiHtml: fs.readFileSync(path.join(selfDir, 'web-ui.html'), 'utf8'),
     describe: () => `model ${modelLabel(settings.model)} · ${effortLabel(settings.effort)} effort · hints on ${opt['fast-model']} · /code runs ${opt.shell === 'cloud' ? "in Claude's cloud sandbox" : 'here'}`,
   });

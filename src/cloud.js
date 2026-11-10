@@ -100,7 +100,8 @@ async function collectOutputs(client, sessionId, { tries = 12, delayMs = 2500 } 
  * Run one /code task in the cloud. Streams text via onText, then hands each changed file to
  * applyChange(rel, content) (the local approval path). Always cleans up the session and upload.
  */
-export async function runCloudTask(client, { root, task, model, net, state, saveState, stageNote = '', onText = () => {}, onStatus = () => {}, applyChange, signal }) {
+export async function runCloudTask(client, { root, task, model, net, state, saveState, stageNote = '', onText = () => {}, onStatus = () => {}, applyChange, signal, meter = null }) {
+  meter?.check(); // spend cap
   onStatus('packing project…');
   const pack = await packProject(root);
   onStatus(`uploading ${pack.files} files (${Math.round(pack.bytes / 1024)} KB${pack.redacted ? `, secrets redacted in ${pack.redacted}` : ''})…`);
@@ -127,11 +128,12 @@ export async function runCloudTask(client, { root, task, model, net, state, save
     for await (const ev of stream) {
       if (ev.type === 'agent.message') for (const b of ev.content ?? []) { if (b.type === 'text') onText(b.text); }
       else if (ev.type === 'agent.tool_use') onText(`\n  ↳ cloud ${ev.name}${ev.name === 'bash' && ev.input?.command ? `: ${String(ev.input.command).slice(0, 80)}` : ''}\n`);
+      else if (ev.type === 'span.model_request_end') { meter?.record(model, ev.model_usage, 'cloud'); if (meter?.overBudget) { onText(`\n[${'spend cap reached'} — stopping the cloud session]\n`); stop = 'budget'; break; } }
       else if (ev.type === 'session.error') throw new Error(`cloud session error: ${ev.error?.message ?? ev.error?.type ?? 'unknown'}`);
       else if (ev.type === 'session.status_idle') { stop = ev.stop_reason?.type ?? 'end_turn'; break; }
       else if (ev.type === 'session.status_terminated') { stop = 'terminated'; break; }
     }
-    if (stop && stop !== 'end_turn') onText(`\n[cloud session stopped: ${stop}]\n`);
+    if (stop && stop !== 'end_turn' && stop !== 'budget') onText(`\n[cloud session stopped: ${stop}]\n`);
 
     onStatus('collecting changes…');
     const out = await collectOutputs(client, session.id);

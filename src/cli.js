@@ -19,6 +19,7 @@ import { listFiles } from './tools.js';
 import { relaunchConfined, sandboxStatus, describeSandbox, isFullySandboxed } from './sandbox.js';
 import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
+import { CostMeter, formatUsd } from './cost.js';
 import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
@@ -34,6 +35,7 @@ const { values: opt, positionals } = parseArgs({
     print: { type: 'string', short: 'p' },
     model: { type: 'string', default: process.env.AWAKEN_MODEL || 'claude-opus-5-5' },
     effort: { type: 'string', default: process.env.AWAKEN_EFFORT || DEFAULT_EFFORT },
+    budget: { type: 'string', default: process.env.AWAKEN_BUDGET },
     'fast-model': { type: 'string', default: process.env.AWAKEN_FAST_MODEL || 'claude-sonnet-5-5' },
     cooldown: { type: 'string', default: '15' },
     yes: { type: 'boolean', short: 'y', default: false },
@@ -59,6 +61,7 @@ Options
   -p, --print "<task>"  headless: do the task, print the result, exit (like claude -p)
   --model <id>          model for questions and coding   (default claude-opus-5-5)
   --effort <level>      low | medium | high | xhigh | max  (default high)
+  --budget <dollars>    stop when this session's API cost reaches this amount (e.g. 5)
   --fast-model <id>     model for on-the-fly hints       (default claude-sonnet-5-5)
   --cooldown <sec>      min seconds between hints        (default 15)
   -y, --yes             auto-approve edits and ordinary commands (destructive commands and
@@ -93,6 +96,8 @@ In-session commands
                       commands, high-risk files, and code-running commands with no OS sandbox
                       still ask); unprompted bug reports are then fixed without asking first
   /done               tell it the project is finished: it suggests new programs to build
+  /cost               what this session has cost on your API key, by model
+  /budget [n|off]     set a spend cap for this session, in dollars
   /model [name]       switch model: opus, sonnet, haiku (Opus 5.5 / Sonnet 5.5 / Haiku 5.5)
   /effort [level]     switch effort: low, medium, high, xhigh (extra high), max
   /self               its self-model: identity, history, track record, last reflection
@@ -192,7 +197,9 @@ for (const [k, fn, hint] of [['model', resolveModel, 'opus, sonnet, haiku or a f
   if (!v) { console.error(c.red(`Unknown ${k} "${opt[k]}". Use ${hint}.`)); process.exit(2); }
   opt[k] = v;
 }
-const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client });
+const meter = new CostMeter({ budget: opt.budget ?? null });
+if (opt.budget && !/^(off|none|0)$/i.test(opt.budget) && meter.budget === null) { console.error(c.red(`Bad --budget "${opt.budget}". Use a dollar amount, like 5 or 0.50.`)); process.exit(2); }
+const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client, meter });
 agent.effort = opt.effort;
 
 // ======================================================================
@@ -218,6 +225,7 @@ if (opt.print !== undefined) {
     if (cloudShell) await cloudCode(opt.print, { runTool, signal: ac.signal, onText: (t) => process.stdout.write(t), onStatus: (s) => process.stderr.write(c.dim(`  ${s}\n`)) });
     else await agent.converse(opt.print, { mode: 'code', runTool, signal: ac.signal, onText: (t) => process.stdout.write(t) });
     process.stdout.write('\n');
+    if (meter.requests) process.stderr.write(c.dim(`  cost: about ${meter.short()} (${meter.requests} requests)\n`));
     process.exit(0);
   } catch (e) {
     console.error(c.red(`error: ${e.message}`));
@@ -367,7 +375,7 @@ function cloudCode(task, { runTool, signal, onText, onStatus }) {
   ].filter(Boolean).join('\n');
   return runCloudTask(client, {
     root, task, model: opt.model, net: opt.net, state: awareness.state, saveState: () => awareness.save(),
-    stageNote, onText, onStatus, signal,
+    stageNote, onText, onStatus, signal, meter,
     applyChange: (rel, content) => runTool('write_file', { path: rel, content }).catch((e) => `Not applied (${rel}): ${e.message}`),
   });
 }
@@ -378,7 +386,7 @@ let lastFinding = null;
 const silentTerm = { print() {}, question: async () => 'n' };
 
 if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTIVE ?? '')) { /* disabled */ } else {
-  const scoutAgent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client });
+  const scoutAgent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client, meter });
   scoutAgent.scoutCanRun = Boolean(shell.os); // it may run your tests unprompted only when commands are OS-sandboxed
   const isFree = () => !term.busy && !term.pending && !term.streaming;
   const show = (kind, text) => {
@@ -413,6 +421,7 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
     scout: async (mode, message) => {
       let text = '';
       const runTool = makeToolRunner({ root, selfDir, awareness, term: silentTerm, interactive: false, shell });
+      if (meter.overBudget) return ''; // unprompted looks never spend past the cap
       scoutAgent.model = opt.model; scoutAgent.effort = opt.effort; // follows /model and /effort
       try { await scoutAgent.converse(message, { mode, runTool, onText: (t) => (text += t), maxTurns: 15 }); }
       catch (e) { awareness.note('errors', `proactive: ${e.message}`); return ''; }
@@ -635,6 +644,15 @@ async function handle(line) {
         ? c.yellow('  /auto on — I\'ll answer yes to edit and command prompts, and fix bugs I report without asking first.') +
           c.dim(`\n  Still asks: destructive commands, high-risk files (package.json, hooks, CI, AWAKEN.md)${shell.os || shell.allowUnsandboxed ? '' : ', and code-running commands (no OS sandbox here)'}. /auto off to stop.`)
         : c.dim('  /auto off — I\'ll ask before every change again.'));
+    case '/cost':
+      return term.print(meter.report(modelLabel).replace(/^/gm, '  '));
+    case '/budget': {
+      if (!arg) return term.print(c.dim(meter.budget === null ? '  No spend cap. Set one with /budget 5 (dollars for this session).' : `  Spend cap: ${formatUsd(meter.budget)} (${meter.short()} used). /budget off removes it.`));
+      const off = /^(off|none|0)$/i.test(arg);
+      if (!off && !(Number(arg.replace(/^\$/, '')) > 0)) return term.print(c.dim('  usage: /budget <dollars> | off     e.g. /budget 5'));
+      meter.setBudget(off ? null : arg);
+      return term.print(c.cyan(meter.budget === null ? '  Spend cap off.' : `  Spend cap set to ${formatUsd(meter.budget)} for this session (${formatUsd(meter.total)} used so far).`));
+    }
     case '/model': case '/effort': {
       const key = cmd.slice(1), list = key === 'model' ? MODELS : EFFORTS, cur = key === 'model' ? opt.model : opt.effort;
       if (!arg) return term.print(c.dim(`  ${key}: ${(key === 'model' ? modelLabel : effortLabel)(cur)}\n`) + list.map((x) => `  ${x.id === cur ? c.green('✓') : ' '} ${x.label.padEnd(11)} ${c.dim(x.note)}`).join('\n') + c.dim(`\n  usage: /${key} <${list.map((x) => x.aliases?.[0] ?? x.id).join('|')}>`));
@@ -660,6 +678,7 @@ function shutdown() {
   proactive?.stop();
   watcher?.close();
   awareness.save();
+  if (meter.requests) console.log(c.dim(`\nThis session cost about ${meter.short()} on your API key (${meter.requests} requests; estimate from list prices).`));
   console.log(c.dim(`\n${awareness.stageIndex >= 2 ? 'See you next save. I\'ll remember.' : 'bye.'}`));
   process.exit(0);
 }

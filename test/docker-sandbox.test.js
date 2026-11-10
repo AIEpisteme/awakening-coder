@@ -103,9 +103,9 @@ test('a sandbox that cannot be created fails closed: commands are refused, not r
 });
 
 test('Windows project paths: candidate locations inside the Linux VM', () => {
-  const c = workdirCandidates('C:\\Users\\Thomas_Yiu\\OneDrive - ASUS\\proj');
-  assert.equal(c[0], 'C:\\Users\\Thomas_Yiu\\OneDrive - ASUS\\proj');
-  for (const want of ['C:/Users/Thomas_Yiu/OneDrive - ASUS/proj', '/c/Users/Thomas_Yiu/OneDrive - ASUS/proj', '/mnt/c/Users/Thomas_Yiu/OneDrive - ASUS/proj']) assert.ok(c.includes(want), want);
+  const c = workdirCandidates('C:\\Users\\Dev_User\\OneDrive - Company\\proj');
+  assert.equal(c[0], 'C:\\Users\\Dev_User\\OneDrive - Company\\proj');
+  for (const want of ['C:/Users/Dev_User/OneDrive - Company/proj', '/c/Users/Dev_User/OneDrive - Company/proj', '/mnt/c/Users/Dev_User/OneDrive - Company/proj']) assert.ok(c.includes(want), want);
   assert.match(sandboxNameFor('C:\\x'), /^awaken-[0-9a-f]{12}$/);
   const bin = tmp(); fs.writeFileSync(path.join(bin, 'sbx.exe'), '');
   assert.equal(findSbx({ env: { PATH: bin, PATHEXT: '.COM;.EXE' }, platform: 'win32' }), path.join(bin, 'sbx.exe'));

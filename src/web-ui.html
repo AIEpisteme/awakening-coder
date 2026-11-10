@@ -34,6 +34,9 @@ header { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; pad
 header h1 { font-size: 16px; margin: 0; }
 .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--soft); color: var(--ink); }
 .spacer { flex: 1; }
+button.cost { border-radius: 999px; padding: 2px 10px; font-size: 12px; font-variant-numeric: tabular-nums; }
+button.cost.near { border-color: var(--warn, #b7791f); color: var(--warn, #b7791f); }
+button.cost.over { border-color: var(--bad, #c53030); color: var(--bad, #c53030); font-weight: 600; }
 aside, .side { overflow: auto; padding: 14px; border-right: 1px solid var(--line); background: var(--panel); }
 .side { border-right: 0; border-left: 1px solid var(--line); }
 h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 8px; }
@@ -118,6 +121,7 @@ input.check { width: auto; }
         <div class="sub" id="subEffort"><button aria-haspopup="menu" aria-expanded="false">Effort <span class="cur" id="curEffort"></span> ▸</button><div class="submenu" role="menu" id="effortList"></div></div>
       </div>
     </div>
+    <button class="cost" id="costBtn" title="What this session has cost on your API key. Click for the breakdown (/cost). Set a cap with /budget 5.">$0.00</button>
     <span class="spacer"></span>
     <label class="row muted" title="A short hint after each save in your editor"><input type="checkbox" id="hints" class="check" checked> hints</label>
     <label class="row muted" id="proLabel" title="From the Lucid stage: unprompted bug reports after you pause, and ideas"><input type="checkbox" id="pro" class="check" checked> proactive</label>
@@ -214,6 +218,7 @@ input.check { width: auto; }
     $('auto').checked = !!s.autoYes;
     $('hints').checked = !!s.hints;
     renderModelMenu(s);
+    renderCost(s.cost);
     const pro = s.proactive || {};
     $('proLabel').hidden = !pro.available; $('lookNow').hidden = !pro.available; $('doneBtn').hidden = !pro.available;
     $('pro').checked = !!pro.enabled;
@@ -259,6 +264,7 @@ input.check { width: auto; }
   function onEvent(ev) {
     switch (ev.type) {
       case 'state': renderState(ev.state); break;
+      case 'cost': if (state) state.cost = ev.cost; renderCost(ev.cost); break;
       case 'start': bubble = el('div', 'msg'); log.append(bubble); scroll(); break;
       case 'text': if (!bubble) { bubble = el('div', 'msg'); log.append(bubble); } bubble.textContent += ev.text; scroll(); break;
       case 'print': log.append(diffBlock(ev.text.replace(/^\n+/, ''))); bubble = null; scroll(); break;
@@ -313,6 +319,21 @@ input.check { width: auto; }
   $('modeAsk').onclick = () => setMode('ask');
   $('modeCode').onclick = () => setMode('code');
 
+  // ---------- cost meter ----------
+  function renderCost(cst) {
+    if (!cst) return;
+    const b = $('costBtn');
+    b.textContent = cst.short;
+    b.classList.toggle('near', !!cst.nearBudget);
+    b.classList.toggle('over', !!cst.overBudget);
+  }
+  const showCost = () => api('/api/cost', {}).then((r) => {
+    const card = el('div', 'card'); card.append(el('div', 'title', 'Cost this session'), el('pre', 'tool', r.report));
+    log.append(card); scroll();
+  }).catch((e) => note(e.message, 'error'));
+  const setBudget = (usd) => api('/api/budget', { usd }).then((r) => { renderState(r); note(r.changed); }).catch((e) => note(e.message, 'error'));
+  $('costBtn').onclick = showCost;
+
   // ---------- model & effort menu ----------
   const labelOf = (list, id) => (list || []).find((x) => x.id === id)?.label || id || 'default';
   function renderModelMenu(s) {
@@ -348,6 +369,8 @@ input.check { width: auto; }
     ['/help', 'show these commands'],
     ['/ask [question]', 'switch to Ask mode (and ask)'],
     ['/code [task]', 'switch to Code mode (and start the task)'],
+    ['/cost', 'what this session has cost, by model'],
+    ['/budget [dollars|off]', 'stop when this session reaches a spend cap, e.g. /budget 5'],
     ['/model [name]', 'switch model: opus, sonnet or haiku (no name: show choices)'],
     ['/effort [level]', 'switch effort: low, medium, high, xhigh (extra high) or max'],
     ['/auto [on|off]', 'approve edits and commands without asking (destructive commands and high-risk files still ask)'],
@@ -382,6 +405,8 @@ input.check { width: auto; }
       case 'ask': setMode('ask'); return rest.trim() ? sendText(rest.trim()) : note('Ask mode.');
       case 'code': setMode('code'); return rest.trim() ? sendText(rest.trim()) : note('Code mode: describe what to build or fix.');
       case 'auto': { const v = onOff(arg, state?.autoYes); return v === null ? note('usage: /auto [on|off]') : setAuto(v); }
+      case 'cost': return showCost();
+      case 'budget': return rest.trim() ? setBudget(rest.trim()) : note(state?.cost?.budget ? `Spend cap: $${state.cost.budget.toFixed(2)} per session (${state.cost.short} used). /budget off removes it.` : 'No spend cap. Set one with /budget 5 (dollars per session).');
       case 'model': case 'effort': {
         const key = name.toLowerCase(), list = key === 'model' ? state?.models : state?.efforts;
         if (!rest.trim()) return note(`${key}: ${labelOf(list, state?.[key])}\nchoices: ${(list || []).map((x) => x.label).join(', ')}`);

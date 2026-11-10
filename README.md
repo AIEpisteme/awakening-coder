@@ -117,7 +117,7 @@ It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
   - **Model:** Opus 5.5, Sonnet 5.5 or Haiku 5.5.
   - **Effort:** Low, Medium, High, Extra high or Max. The setting is sent to Claude as `output_config.effort`.
   - The change applies from your next message, and the app remembers it the next time you start it. You can also type `/model sonnet` or `/effort max`, or start with `--model haiku --effort low`. If a model doesn't accept an effort setting, it falls back to that model's default instead of failing.
-- **Slash commands.** Type `/help` in the chat box for the list: `/ask`, `/code`, `/auto`, `/hints`, `/proactive`, `/look`, `/done`, `/fix`, `/stop`, `/clear`, `/status` and `/sandbox`.
+- **Slash commands.** Type `/help` in the chat box for the list: `/ask`, `/code`, `/auto`, `/hints`, `/proactive`, `/look`, `/done`, `/fix`, `/stop`, `/clear`, `/status`, `/sandbox`, `/cost` and `/budget`.
 - **Projects.**
   - **Local folders:** the folders you passed when starting it. These set its sandbox.
   - **GitHub repos:** paste a GitHub URL to clone it into `~/.awakening-coder/repos/` and work on it there.
@@ -135,6 +135,20 @@ It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
   - Scouting is read-only. It may run your tests only when commands are OS-sandboxed.
 
 It listens on `127.0.0.1` only. Every request needs the random token from the printed link and a matching Host and Origin, so other websites can't drive it, including through DNS rebinding. The page runs under a strict Content Security Policy, and it confines itself like the terminal version. `--shell cloud` runs Code mode in Claude's cloud sandbox.
+
+## It shows what it costs, and stops at your cap
+
+You pay Anthropic directly with your own API key, so the coder shows the bill as it grows.
+
+- **Live cost.** The web app's header shows this session's cost, for example **$0.42 of $5.00**. Click it, or type `/cost`, for the breakdown by model: requests, tokens in and out, and cached tokens. The terminal has `/cost` too, and prints the total when you quit.
+- **Spend cap.** `/budget 5` stops the session at $5. `--budget 5` or `AWAKEN_BUDGET=5` sets it at start, and the web app remembers it.
+  - At 80% it gives one heads-up.
+  - At the cap, new requests are refused before they reach the API, save-hints and unprompted looks go quiet, and a cloud `/code` session is stopped.
+  - `/budget off` removes it. The cap is checked before each request, so the last request can take the total slightly past it.
+- **Prompt caching.** Every chat and coding request asks the API to cache the tools, the system prompt and the conversation so far. Later turns of a long task then re-read that prefix at the cached rate, about 5% of the normal input price on Opus 5.5 and Sonnet 5.5. `/cost` shows roughly how much caching saved.
+- **Where the numbers come from.** Costs are estimates from Anthropic's [list prices](https://platform.claude.com/docs/en/about-claude/pricing) as of 2026-11-09. The Anthropic Console has the billed amount.
+  - If prices change, or you use another model, set `AWAKEN_PRICES='{"model-id":{"in":3,"out":15}}'` (dollars per million tokens).
+  - A model with no known price is counted in tokens, and the total is shown as "≥".
 
 ## It knows whether it's sandboxed, and sandboxes itself
 
@@ -177,6 +191,16 @@ It's told never to probe or work around its limits. If a limit blocks the task (
 ## Run it
 
 Requires Node.js 22 or newer and an Anthropic API key.
+
+Once it's published to npm, no clone is needed:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+npx awakening-coder /path/to/your/project      # terminal
+npx -p awakening-coder awaken-web . --open     # web app
+```
+
+From a git checkout:
 
 ```bash
 npm install
@@ -221,6 +245,8 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 | `/init` | Have it write `AWAKEN.md`, project notes it reads every session (like `CLAUDE.md`) |
 | `/trust` | Review and trust this project's `AWAKEN.md` (needed again after any edit) |
 | `/sandbox` | What it's running inside, and how it's confined |
+| `/cost` | What this session has cost on your API key, by model |
+| `/budget [n\|off]` | Set or remove a spend cap for this session, in dollars |
 | `/evolve <idea>` | Let it write a new version of itself (Lucid and up) |
 | `/rollback` | Undo the last evolution |
 | `/proactive [on\|off\|now]` | From Lucid: unprompted bug reports and ideas. `now` looks right away |
@@ -239,6 +265,7 @@ Without `--yes`, headless mode can read and search but can't apply edits or run 
 
 | Options | |
 |---|---|
+| `--budget` | Spend cap for the session in dollars (env `AWAKEN_BUDGET`) |
 | `--model` | Model for questions and auto-code (default `claude-opus-5-5`, env `AWAKEN_MODEL`) |
 | `--fast-model` | Model for on-the-fly hints (default `claude-sonnet-5-5`, env `AWAKEN_FAST_MODEL`) |
 | `--cooldown <s>` | Minimum seconds between hints (default 15). Saves during cooldown are coalesced. |
