@@ -312,9 +312,11 @@ input.check { width: auto; }
         card.append(el('div', 'title', titles[ev.kind] || 'Note'), el('div', 'body', ev.text));
         const row = el('div', 'row');
         if (ev.kind === 'bugs') {
-          const fix = el('button', 'primary', 'Fix it');
-          fix.onclick = () => { fix.disabled = true; setMode('code'); api('/api/fix', {}).catch((e) => { fix.disabled = false; note(e.message, 'error'); }); };
-          row.append(fix, el('span', 'muted', 'Each edit is shown as a diff. Your approvals setting decides what asks.'));
+          // Both answers are recorded in the proof log (/proof): asked for a fix, or dismissed as not a bug.
+          const fix = el('button', 'primary', 'Fix it'), not = el('button', '', 'Not a bug');
+          fix.onclick = () => { fix.disabled = not.disabled = true; setMode('code'); api('/api/fix', { id: ev.id }).catch((e) => { fix.disabled = not.disabled = false; note(e.message, 'error'); }); };
+          not.onclick = () => { fix.disabled = not.disabled = true; api('/api/proof', { action: 'dismiss', id: ev.id }).then(() => note('Noted: not a bug. It counts as dismissed in the proof log, and I\'ll be more careful.')).catch((e) => { fix.disabled = not.disabled = false; note(e.message, 'error'); }); };
+          row.append(fix, not, el('span', 'muted', 'Each edit is shown as a diff. Your approvals setting decides what asks.'));
         } else row.append(el('span', 'muted', 'Switch to Code and describe one to start it.'));
         card.append(row); log.append(card); bubble = null; scroll(); break;
       }
@@ -413,6 +415,8 @@ input.check { width: auto; }
     ['/look', 'look for bugs and ideas right now'],
     ['/done', 'project finished: suggest new programs'],
     ['/fix', 'fix the last bug it reported on its own'],
+    ['/dismiss', 'the last bug it reported is not a bug'],
+    ['/proof [on|summary|off]', 'bugs it found on its own and what you did; on writes PROOF.md here'],
     ['/stop', 'stop the current task'],
     ['/clear', 'start a new conversation (awareness is kept)'],
     ['/status', 'awareness stage, settings and models'],
@@ -460,6 +464,17 @@ input.check { width: auto; }
       case 'look': return $('lookNow').onclick();
       case 'done': return $('doneBtn').onclick();
       case 'fix': setMode('code'); return api('/api/fix', {}).catch((e) => note(e.message, 'error'));
+      case 'dismiss': return api('/api/proof', { action: 'dismiss' }).then(() => note('Noted: not a bug. It counts as dismissed in the proof log.'));
+      case 'proof': {
+        if (arg && !['on', 'detail', 'summary', 'off'].includes(arg)) return note('usage: /proof [on | summary | off]');
+        const r = await api('/api/proof', arg ? { action: 'publish', mode: arg } : {});
+        if (arg && state) state.proofPublishing = r.publishing;
+        const card = el('div', 'card'); card.append(el('div', 'title', 'Proof log: bugs it found on its own'), el('div', 'body', r.summary));
+        const where = r.publishing ? `Publishing is on (${r.publishing === 'summary' ? 'counts only' : 'counts and the list of findings'}): PROOF.md in this project is rewritten after every report. Commit it to share it. /proof off stops.` : 'Not published. /proof on writes PROOF.md in this project and keeps it up to date (/proof summary for counts only, with no file names).';
+        card.append(el('div', 'muted', `All projects: ${r.all.findings} reported, ${r.all.asked} fix requests, ${r.all.dismissed} dismissed. ${where}`));
+        if (r.stats.findings) card.append(el('pre', 'tool', r.markdown));
+        log.append(card); scroll(); return;
+      }
       case 'stop': return $('stop').onclick();
       case 'clear': case 'new': return $('clear').onclick();
       case 'sandbox': return $('sandboxBtn').onclick();

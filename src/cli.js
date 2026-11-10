@@ -23,6 +23,7 @@ import { CostMeter, formatUsd } from './cost.js';
 import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
 import { APPROVAL_MODES, DEFAULT_APPROVALS, resolveApprovals, approvalsLabel, describeApprovals, sandboxFacts, AllowList } from './approvals.js';
 import { EditJournal } from './changes.js';
+import { ProofLog } from './prooflog.js';
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
 const selfRoot = path.join(selfDir, '..');
@@ -97,6 +98,9 @@ In-session commands
   /reflect            it looks at its own code, track record and limits, and tells you honestly
   /proactive [on|off|now]  from Lucid it reports bugs and suggests ideas unprompted; 'now' looks right away
   /fix                fix the last bug it reported on its own (it also offers this when it reports one)
+  /dismiss            the last bug it reported is not a bug (it learns from that)
+  /proof [on|summary|off]  the bugs it found on its own and what you did about them; "on" writes
+                      PROOF.md in this project and keeps it up to date ("summary": counts only)
   /approvals [mode]   how often it asks: careful, smart or auto (no mode: show the current one)
   /auto [on|off]      shortcut for /approvals auto, like --yes (destructive commands, high-risk
                       files, and code-running commands with no OS sandbox still ask); unprompted
@@ -354,12 +358,14 @@ async function exclusive(fn) {
   }
 }
 
-const converse = (text, mode) => exclusive(async () => {
+// after({ ok, edited }): called when the task has finished.
+const converse = (text, mode, after) => exclusive(async () => {
   announce(awareness.feed(mode === 'code' ? 'code' : 'ask'));
-  if (mode === 'code' && cloudShell) return runCloudInTerminal(text);
+  if (mode === 'code' && cloudShell) return after?.(await runCloudInTerminal(text));
   const journal = new EditJournal();
-  await runAgent(agent, text, mode, { root, approvals: () => approvals, allowList, journal }, mode === 'code' ? '\n⚙  working…' : '');
+  const ok = await runAgent(agent, text, mode, { root, approvals: () => approvals, allowList, journal }, mode === 'code' ? '\n⚙  working…' : '');
   noteEdits(journal);
+  after?.({ ok, edited: journal.files });
 });
 
 function noteEdits(journal) {
@@ -375,11 +381,13 @@ async function runCloudInTerminal(text) {
     onWrite: (rel, content) => { watcher?.noteSelfWrite(rel, content); if (path.normalize(rel) === 'AWAKEN.md') awareness.trustNotes(root, notesHash(content.slice(0, 20_000))); } });
   term.beginStream(c.cyan('\n☁  working in Claude\'s cloud sandbox…'));
   awareness.note('cloudRuns');
+  let ok = false;
   try {
     await cloudCode(text, {
       signal: currentAbort.signal, onText: (t) => term.write(t), onStatus: (s) => term.write(c.dim(`\n  ${s}`)),
       runTool: async (name, input) => { term.streaming = false; try { return await runTool(name, input); } finally { term.streaming = true; } },
     });
+    ok = true;
   } catch (e) {
     const fix = explainApiError(e);
     term.write(currentAbort.signal.aborted ? c.yellow('\n[interrupted — cloud session deleted]') : c.red(`\nerror: ${e.message}`) + (fix ? '\n' + c.yellow('  ' + fix) : ''));
@@ -388,6 +396,7 @@ async function runCloudInTerminal(text) {
     term.streaming = false;
     noteEdits(journal);
   }
+  return { ok, edited: journal.files };
 }
 
 function cloudCode(task, { runTool, signal, onText, onStatus }) {
@@ -406,7 +415,14 @@ function cloudCode(task, { runTool, signal, onText, onStatus }) {
 
 // ---------- proactive mode (Lucid and later) ----------
 let proactive = null;
-let lastFinding = null;
+let lastFinding = null, lastFindingId = null;
+// What it reported on its own, and what you did about it (prooflog.js). Published only if you turn that on.
+const proof = new ProofLog(path.join(homeDir(), 'proof-log.json'));
+function publishProof({ quiet = true } = {}) {
+  const r = proof.publish(root, { onWrite: (rel, content) => watcher?.noteSelfWrite(rel, content) });
+  if (!quiet && !r.written && r.reason && !['off', 'unchanged'].includes(r.reason)) term.print(c.yellow(`  Proof log not published: ${r.reason}`));
+  return r;
+}
 const silentTerm = { print() {}, question: async () => 'n' };
 
 if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTIVE ?? '')) { /* disabled */ } else {
@@ -415,13 +431,13 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
   const isFree = () => !term.busy && !term.pending && !term.streaming;
   const show = (kind, text) => {
     if (!isFree()) return void setTimeout(() => show(kind, text), 5000).unref?.();
-    if (kind === 'bugs') lastFinding = text;
+    if (kind === 'bugs') { lastFinding = text; lastFindingId = proof.add({ root, project: path.basename(root), text }).id; publishProof(); }
     const head = {
       bugs: c.yellow('\n🔎 Unprompted — I think I found something:'),
       ideas: c.cyan('\n💭 While you paused, a few ideas:'),
       programs: c.magenta('\n🌱 Ideas for what to build next:'),
     }[kind];
-    const tail = kind === 'bugs' ? c.dim('  /proactive off to silence me') : c.dim('  /code <idea> to start one · /proactive off to silence me');
+    const tail = kind === 'bugs' ? c.dim('  /dismiss if it isn\'t a bug · /proactive off to silence me') : c.dim('  /code <idea> to start one · /proactive off to silence me');
     term.print(`${head}\n${text.replace(/^(?!\s)/gm, '  ')}\n${tail}`);
     if (kind === 'bugs') void offerFix(text);
   };
@@ -457,7 +473,10 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
 
 function fixFinding(text) {
   awareness.note('proactiveFixed');
-  return converse(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${text}`, 'code');
+  const id = lastFinding === text ? lastFindingId : null;
+  if (id && proof.mark(id, 'accepted')) publishProof();
+  return converse(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${text}`, 'code',
+    ({ ok, edited }) => { if (id && ok && edited.length && proof.mark(id, 'fixed')) publishProof(); });
 }
 
 // ---------- self-evolution ----------
@@ -659,6 +678,30 @@ async function handle(line) {
     case '/fix':
       if (!lastFinding) return term.print(c.dim('  I haven\'t reported a bug on my own yet. (/code <task> to fix something specific.)'));
       return fixFinding(lastFinding);
+    case '/dismiss': {
+      if (!lastFindingId) return term.print(c.dim('  I haven\'t reported a bug on my own in this session.'));
+      if (proof.mark(lastFindingId, 'dismissed')) { awareness.note('proactiveDismissed'); publishProof(); }
+      return term.print(c.dim('  Noted: not a bug. It counts as dismissed in the proof log (/proof), and I\'ll check harder before reporting.'));
+    }
+    case '/proof': {
+      if (arg && !['on', 'detail', 'summary', 'off'].includes(arg)) return term.print(c.dim('  usage: /proof [on | summary | off]'));
+      if (arg) {
+        proof.setPublishing(root, arg === 'off' ? null : arg === 'summary' ? 'summary' : 'detail');
+        if (arg !== 'off') {
+          const r = publishProof();
+          if (!r.written && r.reason !== 'unchanged') { proof.setPublishing(root, null); return term.print(c.yellow(`  ${r.reason}`)); }
+        }
+      }
+      const mode = proof.publishing(root), all = proof.stats();
+      return term.print([
+        c.bold('  Proof log: bugs it found on its own'),
+        `  ${proof.summary(root)}`,
+        c.dim(`  All projects: ${all.findings} reported, ${all.asked} fix requests, ${all.dismissed} dismissed.`),
+        c.dim(mode
+          ? `  Publishing is on (${mode === 'summary' ? 'counts only' : 'counts and the list of findings'}): PROOF.md here is rewritten after every report. Commit it to share it. /proof off stops.`
+          : '  Not published. /proof on writes PROOF.md in this project and keeps it up to date (/proof summary: counts only, no file names).'),
+      ].join('\n'));
+    }
     case '/auto': case '/approvals': {
       const want = cmd === '/auto' ? (arg === 'on' ? 'auto' : arg === 'off' ? DEFAULT_APPROVALS : arg === '' ? (isAuto() ? DEFAULT_APPROVALS : 'auto') : null) : (arg ? resolveApprovals(arg) : approvals);
       if (!want) return term.print(c.dim(cmd === '/auto' ? '  usage: /auto [on|off]' : `  usage: /approvals <${APPROVAL_MODES.map((m) => m.id).join('|')}>`));

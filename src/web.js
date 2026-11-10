@@ -22,6 +22,7 @@ import { CostMeter, formatUsd } from './cost.js';
 import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
 import { APPROVAL_MODES, DEFAULT_APPROVALS, resolveApprovals, approvalsLabel, describeApprovals, sandboxFacts, AllowList } from './approvals.js';
 import { EditJournal } from './changes.js';
+import { ProofLog } from './prooflog.js';
 
 const MAX_BODY = 1_000_000;
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -83,6 +84,13 @@ export function createWebApp({
     settings.approvals = saved && saved !== 'auto' ? saved : DEFAULT_APPROVALS;
   }
   const allowList = new AllowList(stateDir ? path.join(stateDir, 'allowed-commands.json') : null);
+  // What it reported on its own and what you did about it (see prooflog.js). Published only where you turn that on.
+  const proof = new ProofLog(stateDir ? path.join(stateDir, 'proof-log.json') : null);
+  const publishProof = (p, { quiet = false } = {}) => {
+    const r = proof.publish(p.root, { onWrite: (rel, content) => { if (p === current) watcher?.noteSelfWrite?.(rel, content); } });
+    if (!quiet && !r.written && r.reason && !['off', 'unchanged'].includes(r.reason)) emit({ type: 'status', text: `Proof log not published: ${r.reason}` });
+    return r;
+  };
   // The spend cap is remembered too (a --budget flag or AWAKEN_BUDGET, already set on the meter, wins).
   if (settingsFile && meter.budget === null) { try { meter.setBudget(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).budget ?? null); } catch { /* first run */ } }
   const saveSettings = () => { try { if (settingsFile) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify({ model: settings.model, effort: settings.effort, budget: meter.budget, approvals: settings.approvals })); } } catch { /* best effort */ } };
@@ -135,13 +143,20 @@ export function createWebApp({
   };
 
   // ---------- live: save-hints and unprompted reports (same logic as the terminal) ----------
-  let hints = true, watcher = null, lastHintAt = 0, hintTimer = null, queued = null, lastFinding = null;
+  let hints = true, watcher = null, lastHintAt = 0, hintTimer = null, queued = null;
+  let lastFinding = null; // { id, text, project } — the newest unprompted bug report
+  let scouting = null; // the project the scout is looking at (you may switch projects before it reports)
   const isFree = () => !job && questions.size === 0;
   const proactive = scout && awareness ? new Proactive({
     awareness, isFree, isQuiet: () => false, config: proactiveConfig,
     listCode: () => (current ? listFiles(current.root, '.', 500) : Promise.resolve([])),
-    show: (kind, text) => { if (kind === 'bugs') lastFinding = text; emit({ type: 'proactive', kind, text }); },
-    scout: (mode, msg) => (current ? scout(mode, msg, current.root) : Promise.resolve('')),
+    show: (kind, text) => {
+      const p = scouting ?? current;
+      let id;
+      if (kind === 'bugs' && p) { id = proof.add({ root: p.root, project: p.name, text }).id; lastFinding = { id, text, project: p }; publishProof(p); }
+      emit({ type: 'proactive', kind, text, id });
+    },
+    scout: (mode, msg) => { scouting = current; return current ? scout(mode, msg, current.root) : Promise.resolve(''); },
   }) : null;
 
   async function hint(change) {
@@ -192,12 +207,13 @@ export function createWebApp({
       model: settings.model, effort: settings.effort, cost: meter.toJSON(),
       models: MODELS.map(({ id, label, note }) => ({ id, label, note })), efforts: EFFORTS.map(({ id, label, note }) => ({ id, label, note })), osSandbox: Boolean(shell.os),
       proactive: proactive ? { available: true, enabled: proactive.enabled, awake: proactive.awake, status: proactive.status() } : { available: false },
-      lastFinding: Boolean(lastFinding),
+      lastFinding: Boolean(lastFinding), proofPublishing: current ? proof.publishing(current.root) : null,
       stage: awareness?.describe?.() ?? '', sandbox: sandboxReport, info: describe(),
     };
   }
 
-  async function startMessage(text, mode) {
+  // after({ ok, edited }): called once the task has finished, whatever happened.
+  async function startMessage(text, mode, after) {
     if (!current) throw Object.assign(new Error('Pick a project first.'), { status: 400 });
     if (job) throw Object.assign(new Error('Busy with the last request; stop it or wait.'), { status: 409 });
     const p = current, ac = new AbortController();
@@ -207,16 +223,19 @@ export function createWebApp({
     p.agent?.cancelSuggestion?.();
     // One runner per task: "approve all edits in this task" ends with it. The journal lets /undo put the edits back.
     const journal = new EditJournal();
+    let ok = false;
     const runTool = makeToolRunner({ root: p.root, selfDir, awareness, term: webTerm, approvals: () => settings.approvals, allowList, journal, shell: toolShell, signal: ac.signal, onWrite: (rel, content) => watcher?.noteSelfWrite?.(rel, content) });
     try {
       if (mode === 'code' && runCode) await runCode(text, { root: p.root, runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }), onStatus: (s) => emit({ type: 'status', text: strip(s) }) });
       else await agentFor(p).converse(text, { mode: mode === 'code' ? 'code' : 'ask', runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }) });
+      ok = true;
       emit({ type: 'done', edited: journal.files });
     } catch (e) {
       emit({ type: 'error', text: ac.signal.aborted ? 'Stopped.' : strip(e.message), edited: journal.files });
     } finally {
       answerAll('n');
       if (journal.entries.length) p.journal = journal; // the last task that edited something is the one /undo reverts
+      try { after?.({ ok, edited: journal.files }); } catch { /* bookkeeping must not break the session */ }
       job = null;
       emit({ type: 'state', state: stateJson() });
     }
@@ -427,11 +446,38 @@ export function createWebApp({
           return json(res, 200, stateJson());
         }
         case '/api/fix': {
-          if (!lastFinding) return json(res, 400, { error: 'No unprompted bug report to fix yet.' });
+          // Fix an unprompted bug report: the newest one, or the one whose card was clicked ({ id }).
+          const rep = body.id ? proof.get(String(body.id)) : null;
+          const finding = rep ? { id: rep.id, text: rep.text, project: [...projects.values()].find((p) => path.resolve(p.root) === rep.root) } : lastFinding;
+          if (!finding?.text) return json(res, 400, { error: 'No unprompted bug report to fix yet.' });
           if (job) return json(res, 409, { error: 'Busy with the last request; stop it or wait.' });
+          if (finding.project && finding.project !== current) return json(res, 400, { error: `That report is about ${finding.project.name}. Switch to that project first.` });
           awareness?.note('proactiveFixed');
-          void startMessage(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${lastFinding}`, 'code');
+          const target = current;
+          if (proof.mark(finding.id, 'accepted')) publishProof(target);
+          void startMessage(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${finding.text}`, 'code',
+            ({ ok, edited }) => { if (ok && edited.length && proof.mark(finding.id, 'fixed')) publishProof(target); });
           return json(res, 202, { started: true });
+        }
+        case '/api/proof': {
+          // {}: the numbers. { action: 'dismiss', id? }: not a bug. { action: 'publish', mode: 'detail' | 'summary' | 'off' }: PROOF.md in this project.
+          if (!current) return json(res, 400, { error: 'No project' });
+          if (body.action === 'dismiss') {
+            const id = body.id ? String(body.id) : lastFinding?.id;
+            const rep = id ? proof.get(id) : null;
+            if (!rep) return json(res, 400, { error: 'No unprompted bug report to dismiss.' });
+            if (proof.mark(rep.id, 'dismissed')) { awareness?.note('proactiveDismissed'); const p = [...projects.values()].find((x) => path.resolve(x.root) === rep.root); if (p) publishProof(p); }
+          } else if (body.action === 'publish') {
+            const mode = body.mode === 'off' ? null : body.mode === 'summary' ? 'summary' : body.mode === 'detail' || body.mode === 'on' ? 'detail' : undefined;
+            if (mode === undefined) return json(res, 400, { error: 'Use detail, summary or off.' });
+            proof.setPublishing(current.root, mode);
+            if (mode) {
+              const r = publishProof(current, { quiet: true });
+              if (!r.written && r.reason !== 'unchanged') { proof.setPublishing(current.root, null); return json(res, 400, { error: r.reason }); }
+            }
+            emit({ type: 'state', state: stateJson() });
+          } else if (body.action) return json(res, 400, { error: 'Unknown action' });
+          return json(res, 200, { summary: proof.summary(current.root), stats: proof.stats(current.root), all: proof.stats(), publishing: proof.publishing(current.root), markdown: proof.markdown(current.root, proof.publishing(current.root) ?? 'detail') });
         }
         case '/api/clear': if (current?.agent) current.agent.history = []; return json(res, 200, { ok: true });
         case '/api/commit': if (!current) return json(res, 400, { error: 'No project' }); return json(res, 200, await commit(current, body.message));
@@ -445,7 +491,7 @@ export function createWebApp({
 
   server.on('listening', () => { void watchCurrent(); });
   server.on('close', () => { try { watcher?.close(); } catch { /* closed */ } proactive?.stop(); clearTimeout(hintTimer); });
-  return { server, token, projects, emit, state: stateJson, proactive, allowList, get autoYes() { return isAuto(); } };
+  return { server, token, projects, emit, state: stateJson, proactive, allowList, proof, get autoYes() { return isAuto(); } };
 }
 
 // ======================================================================
