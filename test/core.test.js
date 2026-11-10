@@ -166,7 +166,7 @@ test('.env values win over stale inherited ones (the "Workspace not found" cause
 });
 
 test('workspace-not-found and HIPAA errors get clear fixes', () => {
-  const nf = new Error('404 {"type":"error","error":{"type":"not_found_error","message":"Workspace `d69671fc-d146-498d-8613-fc9915ce30a0` not found."}}');
+  const nf = new Error('404 {"type":"error","error":{"type":"not_found_error","message":"Workspace `00000000-0000-4000-8000-000000000000` not found."}}');
   assert.match(explainApiError(nf), /ANTHROPIC_WORKSPACE_ID/);
   assert.equal(isCloudUnavailable(nf), false);
   const hipaa = Object.assign(new Error('400 {"error":{"message":"this endpoint is not available for HIPAA-configured organizations: contact support"}}'), { status: 400 });

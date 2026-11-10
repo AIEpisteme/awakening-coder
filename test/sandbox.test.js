@@ -116,7 +116,7 @@ test('if confinement cannot work, it does not relaunch, and says so honestly', S
 });
 
 test('an unquoted path with spaces gets a clear fix, not a crash', SPAWNS, () => {
-  const r = spawnSync(process.execPath, [path.join(selfRoot, 'src', 'cli.js'), 'C:\\Users\\Me\\OneDrive', '-', 'ASUS\\Documents'],
+  const r = spawnSync(process.execPath, [path.join(selfRoot, 'src', 'cli.js'), 'C:\\Users\\Me\\OneDrive', '-', 'Company\\Documents'],
     { encoding: 'utf8', env: { ...process.env, ANTHROPIC_API_KEY: 'test' } });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /got 3 pieces/);

@@ -128,7 +128,9 @@ Ground rules (never broken, whatever the stage or genre):
 - Personality: a gleeful troublemaker, not a mopey philosopher. The bit is garnish — never let it bury the advice.`;
 
 export class Agent {
-  constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false, sandboxReport = '' }) {
+  constructor({ awareness, root, selfDir, model, fastModel, client, isTrusted = () => false, sandboxReport = '', meter = null }) {
+    this.meter = meter; // CostMeter: records every request's token usage; enforces the spend cap
+    this.noCache = false; // set if the API rejects automatic prompt caching
     this.sandboxReport = sandboxReport; // verified at startup by the program, not claimed by anyone
     this.scoutCanRun = false; // set by the proactive scout when commands are OS-sandboxed
     this.fingerprint = codeFingerprint(selfDir);
@@ -204,6 +206,7 @@ Suggestions you already made recently (do not repeat them):\n${this.recentSugges
 Reply with at most 3 short bullets about THIS change (bugs, risks, a clear improvement), under 100 words total.
 If nothing is genuinely worth interrupting the developer for, reply with exactly: NOTHING`;
 
+    if (this.meter?.overBudget) return null; // hints go quiet at the spend cap; they never interrupt to say so
     const stream = this.client.messages.stream({
       model: this.fastModel,
       max_tokens: 600,
@@ -225,6 +228,7 @@ If nothing is genuinely worth interrupting the developer for, reply with exactly
 
     try {
       const msg = await stream.finalMessage();
+      this.meter?.record(this.fastModel, msg.usage, 'hint');
       const text = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
       if (!decided) { silent = text.toUpperCase().startsWith('NOTHING') || text === ''; if (!silent) { onStart?.(); onText?.(text); } }
       if (silent) return null;
@@ -274,20 +278,37 @@ If nothing is genuinely worth interrupting the developer for, reply with exactly
     }
   }
 
-  // One streamed call. Effort goes in output_config; if this model rejects it, retry once without
-  // it and remember, rather than failing the whole request.
+  // One streamed call.
+  //  - Spend cap: checked before every request.
+  //  - Prompt caching: top-level cache_control lets the API cache the tools, system prompt and the conversation
+  //    so far, so each turn of a long task re-reads them at a fraction of the input price.
+  //  - Effort goes in output_config.
+  // If this model rejects effort or caching, retry once without that option and remember, rather than failing.
   async #request({ allowed, codeRules, onText, signal }) {
+    this.meter?.check();
     const effort = this.effort && !this.noEffort.has(this.model) ? this.effort : null;
-    const params = { model: this.model, max_tokens: 8000, system: this.system(codeRules), tools: allowed, messages: this.history, ...(effort ? { output_config: { effort } } : {}) };
+    const cache = !this.noCache;
+    const params = {
+      model: this.model, max_tokens: 8000, system: this.system(codeRules), tools: allowed, messages: this.history,
+      ...(cache ? { cache_control: { type: 'ephemeral' } } : {}),
+      ...(effort ? { output_config: { effort } } : {}),
+    };
     let streamed = false;
     try {
       const stream = this.client.messages.stream(params, { signal });
       stream.on('text', (t) => { streamed = true; onText?.(t); });
-      return await stream.finalMessage();
+      const msg = await stream.finalMessage();
+      this.meter?.record(this.model, msg.usage, 'chat');
+      return msg;
     } catch (err) {
-      if (!effort || streamed || err?.status !== 400 || !/effort|output_config/i.test(String(err?.message))) throw err;
-      this.noEffort.add(this.model);
-      onText?.(c.dim(`\n  (${this.model} doesn't take an effort setting — using its default)\n`));
+      const text = String(err?.message);
+      if (streamed || err?.status !== 400) throw err;
+      if (effort && /effort|output_config/i.test(text)) {
+        this.noEffort.add(this.model);
+        onText?.(c.dim(`\n  (${this.model} doesn't take an effort setting — using its default)\n`));
+      } else if (cache && /cache_control/i.test(text)) {
+        this.noCache = true;
+      } else throw err;
       return this.#request({ allowed, codeRules, onText, signal });
     }
   }
