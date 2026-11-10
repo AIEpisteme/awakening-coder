@@ -23,7 +23,8 @@
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
-button, input, textarea { font: inherit; color: inherit; }
+button, input, textarea, select { font: inherit; color: inherit; }
+select { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px 6px; }
 button { cursor: pointer; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 12px; }
 button.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
 button:disabled { opacity: .5; cursor: default; }
@@ -58,6 +59,8 @@ pre.tool .add { color: var(--add); background: var(--add-bg); display: block; }
 pre.tool .del { color: var(--del); background: var(--del-bg); display: block; }
 .ask { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn); border-radius: 10px; padding: 10px 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .ask .q { flex: 1; min-width: 200px; }
+.ask .why { font-size: 12px; opacity: .85; margin-top: 2px; }
+.msg.note button { margin-left: 8px; padding: 2px 10px; font-size: 12px; }
 .composer { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 16px; display: grid; gap: 8px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .seg button { border-radius: 0; }
@@ -127,7 +130,7 @@ input.check { width: auto; }
     <label class="row muted" id="proLabel" title="From the Lucid stage: unprompted bug reports after you pause, and ideas"><input type="checkbox" id="pro" class="check" checked> proactive</label>
     <button id="lookNow" title="Look for bugs and ideas right now (Lucid and later)">Look now</button>
     <button id="doneBtn" title="Tell it the project is finished: it suggests new programs to build">Project done?</button>
-    <label class="row muted" title="Approve edits and commands without asking, starting right away (also /auto). Destructive commands and high-risk files still ask."><input type="checkbox" id="auto" class="check"> auto-approve</label>
+    <label class="row muted" id="approvalsLabel" title="How often it asks before acting (/approvals)">approvals <select id="approvals" aria-label="How often it asks before acting"></select></label>
     <button id="sandboxBtn">Sandbox</button>
   </header>
 
@@ -215,7 +218,10 @@ input.check { width: auto; }
     $('stage').textContent = s.stage || 'awakening-coder';
     const cur = s.projects.find((p) => p.id === s.current);
     $('project').textContent = cur ? cur.name : 'no project';
-    $('auto').checked = !!s.autoYes;
+    const sel = $('approvals');
+    if (sel.options.length !== (s.approvalModes || []).length) { sel.replaceChildren(); for (const m of s.approvalModes || []) { const o = el('option', '', m.label); o.value = m.id; o.title = m.note; sel.append(o); } }
+    sel.value = s.approvals || 'smart';
+    $('approvalsLabel').title = (s.approvalsNote || '') + ' (/approvals)';
     $('hints').checked = !!s.hints;
     renderModelMenu(s);
     renderCost(s.cost);
@@ -265,22 +271,33 @@ input.check { width: auto; }
     switch (ev.type) {
       case 'state': renderState(ev.state); break;
       case 'cost': if (state) state.cost = ev.cost; renderCost(ev.cost); break;
-      case 'start': bubble = el('div', 'msg'); log.append(bubble); scroll(); break;
+      case 'start': log.querySelectorAll('button.undo').forEach((b) => b.remove()); bubble = el('div', 'msg'); log.append(bubble); scroll(); break;
       case 'text': if (!bubble) { bubble = el('div', 'msg'); log.append(bubble); } bubble.textContent += ev.text; scroll(); break;
       case 'print': log.append(diffBlock(ev.text.replace(/^\n+/, ''))); bubble = null; scroll(); break;
       case 'status': note(ev.text); break;
       case 'announce': note('✦ ' + ev.text, 'announce'); break;
       case 'question': {
+        // Buttons come from the choices the server offers: yes/no, plus at most one wider grant.
         const card = el('div', 'ask'); card.dataset.id = ev.id;
-        card.append(el('div', 'q', ev.prompt.replace(/\s*\[y\/N\]\s*$/, '')));
-        const yes = el('button', 'primary', 'Approve'), no = el('button', '', 'Decline');
-        const answer = (a) => { yes.disabled = no.disabled = true; api('/api/answer', { id: ev.id, answer: a }).catch((e) => note(e.message, 'error')); };
-        yes.onclick = () => answer('y'); no.onclick = () => answer('n');
-        card.append(yes, no); log.append(card); bubble = null; scroll(); yes.focus();
+        const q = el('div', 'q', ev.prompt.replace(/\s*\[y\/N\]\s*$/, ''));
+        if (ev.why) q.append(el('div', 'why', ev.why));
+        const isCmd = ev.kind === 'command' || ev.kind === 'danger', keep = /^Keep this change/.test(ev.prompt);
+        const labels = { y: keep ? 'Keep it' : isCmd ? 'Run' : 'Approve', task: 'Approve all edits in this task', always: 'Always allow in this project', n: keep ? 'Put it back' : 'Decline' };
+        const buttons = (ev.choices || ['y', 'n']).map((ch) => {
+          const b = el('button', ch === 'y' ? 'primary' : '', labels[ch] || ch);
+          b.onclick = () => { buttons.forEach((x) => { x.disabled = true; }); api('/api/answer', { id: ev.id, answer: ch }).catch((e) => note(e.message, 'error')); };
+          return b;
+        });
+        card.append(q, ...buttons); log.append(card); bubble = null; scroll(); buttons[0].focus();
         break;
       }
-      case 'answered': { const card = log.querySelector(`.ask[data-id="${CSS.escape(ev.id)}"]`); if (card) { card.querySelectorAll('button').forEach((b) => b.remove()); card.append(el('span', 'muted', ev.by === 'auto' ? 'auto-approved' : 'answered')); } break; }
-      case 'error': note(ev.text, 'error'); bubble = null; break;
+      case 'answered': {
+        const card = log.querySelector(`.ask[data-id="${CSS.escape(ev.id)}"]`);
+        const said = { y: 'approved', task: 'approved, with all edits in this task', always: 'approved, and always allowed here', n: 'declined' }[ev.answer] || 'answered';
+        if (card) { card.querySelectorAll('button').forEach((b) => b.remove()); card.append(el('span', 'muted', ev.by === 'auto' ? 'auto-approved' : said)); }
+        break;
+      }
+      case 'error': note(ev.text, 'error'); bubble = null; offerUndo(ev.edited); break;
       case 'saved': $('savedLine').textContent = 'saved ' + ev.rel + ' · '; break;
       case 'hint': {
         const card = el('div', 'card hint'); card.dataset.hint = ev.id;
@@ -297,12 +314,26 @@ input.check { width: auto; }
         if (ev.kind === 'bugs') {
           const fix = el('button', 'primary', 'Fix it');
           fix.onclick = () => { fix.disabled = true; setMode('code'); api('/api/fix', {}).catch((e) => { fix.disabled = false; note(e.message, 'error'); }); };
-          row.append(fix, el('span', 'muted', 'Each edit still shows a diff for you to approve.'));
+          row.append(fix, el('span', 'muted', 'Each edit is shown as a diff. Your approvals setting decides what asks.'));
         } else row.append(el('span', 'muted', 'Switch to Code and describe one to start it.'));
         card.append(row); log.append(card); bubble = null; scroll(); break;
       }
-      case 'done': bubble = null; loadGit(); loadFiles(); break;
+      case 'done': bubble = null; offerUndo(ev.edited); loadGit(); loadFiles(); break;
     }
+  }
+
+  // After a task that edited files: say which, and offer to put them back.
+  const undo = () => api('/api/undo', {}).then((r) => {
+    if (r.state) renderState(r.state);
+    const parts = [r.restored.length && 'Put back: ' + r.restored.join(', '), r.removed.length && 'Removed (it had created them): ' + r.removed.join(', '), r.skipped.length && 'Left alone because they changed since: ' + r.skipped.join(', ')].filter(Boolean);
+    note(parts.join('\n') || 'Nothing to undo.'); loadGit(); loadFiles();
+  }).catch((e) => note(e.message, 'error'));
+  function offerUndo(edited) {
+    if (!edited || !edited.length) return;
+    const n = el('div', 'msg note', `Edited ${edited.length} file${edited.length === 1 ? '' : 's'}: ${edited.slice(0, 6).join(', ')}${edited.length > 6 ? ', …' : ''}`);
+    const b = el('button', 'undo', 'Undo these edits');
+    b.onclick = () => { b.remove(); undo(); };
+    n.append(b); log.append(n); scroll();
   }
 
   function connect() {
@@ -314,7 +345,7 @@ input.check { width: auto; }
   const setMode = (m) => {
     mode = m;
     $('modeAsk').classList.toggle('on', m === 'ask'); $('modeCode').classList.toggle('on', m === 'code');
-    $('modeHint').textContent = m === 'ask' ? 'Ask questions about the code. Nothing is changed.' : 'It plans, edits and runs tests. Every edit shows a diff for you to approve.';
+    $('modeHint').textContent = m === 'ask' ? 'Ask questions about the code. Nothing is changed.' : 'It plans, edits and runs tests. Every edit is shown as a diff, and risky steps always ask.';
   };
   $('modeAsk').onclick = () => setMode('ask');
   $('modeCode').onclick = () => setMode('code');
@@ -373,7 +404,10 @@ input.check { width: auto; }
     ['/budget [dollars|off]', 'stop when this session reaches a spend cap, e.g. /budget 5'],
     ['/model [name]', 'switch model: opus, sonnet or haiku (no name: show choices)'],
     ['/effort [level]', 'switch effort: low, medium, high, xhigh (extra high) or max'],
-    ['/auto [on|off]', 'approve edits and commands without asking (destructive commands and high-risk files still ask)'],
+    ['/approvals [mode]', 'how often it asks: careful (every time), smart (default) or auto'],
+    ['/auto [on|off]', 'shortcut for /approvals auto, and back to smart'],
+    ['/allowed [clear|remove N]', 'commands you chose to always allow in this project'],
+    ['/undo', 'put back the edits from the last task'],
     ['/hints [on|off]', 'hint cards when you save a file'],
     ['/proactive [on|off]', 'unprompted bug reports and ideas (Lucid and later)'],
     ['/look', 'look for bugs and ideas right now'],
@@ -386,10 +420,9 @@ input.check { width: auto; }
     ['/files, /git', 'refresh the file list or git panel'],
   ];
   const onOff = (arg, cur) => (arg === 'on' ? true : arg === 'off' ? false : arg === '' ? !cur : null);
-  const autoNote = (on) => note(on
-    ? 'Auto-approve on: edits and commands go ahead without asking' + (state && !state.osSandbox ? ', and commands run directly on this computer (no OS sandbox here)' : '') + '. Destructive commands and high-risk files (package.json, hooks, CI, AWAKEN.md) still ask. /auto off to stop.'
-    : 'Auto-approve off: I\'ll ask before every change again.');
-  const setAuto = (on) => api('/api/auto', { on }).then((s) => { renderState(s); autoNote(on); }).catch((e) => note(e.message, 'error'));
+  const setApprovals = (mode) => api('/api/approvals', { mode }).then((s) => { renderState(s); note(s.changed); }).catch((e) => { note(e.message, 'error'); if (state) $('approvals').value = state.approvals; });
+  const setAuto = (on) => setApprovals(on ? 'auto' : 'smart');
+  const showAllowed = (s) => note((s.allowed || []).length ? 'Always allowed in this project:\n' + s.allowed.map((c, i) => `  ${i + 1}. ${c}`).join('\n') + '\n/allowed remove N, or /allowed clear' : 'No commands are always allowed in this project. When a command asks, choose "Always allow in this project" to add it.');
 
   async function command(text) {
     const [, name, rest = ''] = text.match(/^\/(\S+)\s*([\s\S]*)$/) || [];
@@ -405,6 +438,16 @@ input.check { width: auto; }
       case 'ask': setMode('ask'); return rest.trim() ? sendText(rest.trim()) : note('Ask mode.');
       case 'code': setMode('code'); return rest.trim() ? sendText(rest.trim()) : note('Code mode: describe what to build or fix.');
       case 'auto': { const v = onOff(arg, state?.autoYes); return v === null ? note('usage: /auto [on|off]') : setAuto(v); }
+      case 'approvals': case 'approval':
+        if (!arg) return note(`approvals: ${labelOf(state?.approvalModes, state?.approvals)}\n${state?.approvalsNote || ''}\nchoices: ${(state?.approvalModes || []).map((m) => `${m.id} (${m.label}: ${m.note})`).join('; ')}`);
+        return setApprovals(arg);
+      case 'allowed': {
+        if (!arg) return showAllowed(state || await api('/api/state'));
+        const m = /^(?:remove|rm)\s+(.+)$/.exec(rest.trim());
+        if (arg !== 'clear' && !m) return note('usage: /allowed [clear | remove N]');
+        return api('/api/allowed', arg === 'clear' ? { clear: true } : { remove: m[1] }).then((s) => { renderState(s); showAllowed(s); });
+      }
+      case 'undo': return undo();
       case 'cost': return showCost();
       case 'budget': return rest.trim() ? setBudget(rest.trim()) : note(state?.cost?.budget ? `Spend cap: $${state.cost.budget.toFixed(2)} per session (${state.cost.short} used). /budget off removes it.` : 'No spend cap. Set one with /budget 5 (dollars per session).');
       case 'model': case 'effort': {
@@ -424,7 +467,7 @@ input.check { width: auto; }
       case 'git': return loadGit();
       case 'status': case 'self': {
         const s = state || await api('/api/state');
-        return note([s.stage, `auto-approve ${s.autoYes ? 'on' : 'off'} · hints ${s.hints ? 'on' : 'off'} · proactive ${s.proactive?.available ? s.proactive.status : 'not available'}`, s.info].filter(Boolean).join('\n'));
+        return note([s.stage, `approvals ${labelOf(s.approvalModes, s.approvals)} · hints ${s.hints ? 'on' : 'off'} · proactive ${s.proactive?.available ? s.proactive.status : 'not available'}`, s.info].filter(Boolean).join('\n'));
       }
       default: return note(`Unknown command /${name}. Type /help for the list.`, 'error');
     }
@@ -450,7 +493,7 @@ input.check { width: auto; }
   $('pro').onchange = (e) => api('/api/proactive', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
   $('lookNow').onclick = () => { note('Looking for bugs and ideas…'); api('/api/proactive', { action: 'now' }).catch((e) => note(e.message, 'error')); };
   $('doneBtn').onclick = () => { note('Finished? Nice. Thinking about what to build next…'); api('/api/proactive', { action: 'done' }).catch((e) => note(e.message, 'error')); };
-  $('auto').onchange = (e) => setAuto(e.target.checked);
+  $('approvals').onchange = (e) => setApprovals(e.target.value);
   $('sandboxBtn').onclick = () => { if (state) note(state.sandbox + (state.info ? '\n' + state.info : '')); };
   $('ghForm').onsubmit = (e) => {
     e.preventDefault();

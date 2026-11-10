@@ -21,6 +21,8 @@ import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
 import { CostMeter, formatUsd } from './cost.js';
 import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
+import { APPROVAL_MODES, DEFAULT_APPROVALS, resolveApprovals, approvalsLabel, describeApprovals, sandboxFacts, AllowList } from './approvals.js';
+import { EditJournal } from './changes.js';
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
 const selfRoot = path.join(selfDir, '..');
@@ -39,6 +41,7 @@ const { values: opt, positionals } = parseArgs({
     'fast-model': { type: 'string', default: process.env.AWAKEN_FAST_MODEL || 'claude-sonnet-5-5' },
     cooldown: { type: 'string', default: '15' },
     yes: { type: 'boolean', short: 'y', default: false },
+    approvals: { type: 'string', default: process.env.AWAKEN_APPROVALS },
     quiet: { type: 'boolean', short: 'q', default: false },
     forget: { type: 'boolean', default: false },
     'trust-notes': { type: 'boolean', default: false },
@@ -64,8 +67,10 @@ Options
   --budget <dollars>    stop when this session's API cost reaches this amount (e.g. 5)
   --fast-model <id>     model for on-the-fly hints       (default claude-sonnet-5-5)
   --cooldown <sec>      min seconds between hints        (default 15)
-  -y, --yes             auto-approve edits and ordinary commands (destructive commands and
-                        high-risk files like package.json, hooks, CI and AWAKEN.md still ask)
+  --approvals <mode>    how often it asks: careful (every edit and command), smart (default: edits
+                        once per task, sandboxed commands just run) or auto
+  -y, --yes             same as --approvals auto: edits and ordinary commands go ahead (destructive
+                        commands and high-risk files like package.json, hooks, CI and AWAKEN.md still ask)
   --trust-notes         (headless) follow this project's AWAKEN.md for this run
   --net                 allow network for sandboxed commands (e.g. npm install)
   --no-sandbox          don't confine itself (not recommended; it will know, and say so)
@@ -92,9 +97,12 @@ In-session commands
   /reflect            it looks at its own code, track record and limits, and tells you honestly
   /proactive [on|off|now]  from Lucid it reports bugs and suggests ideas unprompted; 'now' looks right away
   /fix                fix the last bug it reported on its own (it also offers this when it reports one)
-  /auto [on|off]      answer yes to approval prompts for this session, like --yes (destructive
-                      commands, high-risk files, and code-running commands with no OS sandbox
-                      still ask); unprompted bug reports are then fixed without asking first
+  /approvals [mode]   how often it asks: careful, smart or auto (no mode: show the current one)
+  /auto [on|off]      shortcut for /approvals auto, like --yes (destructive commands, high-risk
+                      files, and code-running commands with no OS sandbox still ask); unprompted
+                      bug reports are then fixed without asking first
+  /allowed [clear|remove N]  commands you chose to always allow in this project
+  /undo               put back the edits from the last task
   /done               tell it the project is finished: it suggests new programs to build
   /cost               what this session has cost on your API key, by model
   /budget [n|off]     set a spend cap for this session, in dollars
@@ -197,6 +205,8 @@ for (const [k, fn, hint] of [['model', resolveModel, 'opus, sonnet, haiku or a f
   if (!v) { console.error(c.red(`Unknown ${k} "${opt[k]}". Use ${hint}.`)); process.exit(2); }
   opt[k] = v;
 }
+if (opt.approvals && !resolveApprovals(opt.approvals)) { console.error(c.red(`Unknown --approvals "${opt.approvals}". Use careful, smart or auto.`)); process.exit(2); }
+const allowList = new AllowList(path.join(homeDir(), 'allowed-commands.json'));
 const meter = new CostMeter({ budget: opt.budget ?? null });
 if (opt.budget && !/^(off|none|0)$/i.test(opt.budget) && meter.budget === null) { console.error(c.red(`Bad --budget "${opt.budget}". Use a dollar amount, like 5 or 0.50.`)); process.exit(2); }
 const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client, meter });
@@ -217,7 +227,8 @@ if (opt.print !== undefined) {
     else console.error(c.yellow('AWAKEN.md is not trusted, so it is being ignored (review it, then pass --trust-notes or run /trust interactively).'));
   }
   if (!isFullySandboxed(sandbox)) console.error(c.yellow(`Not fully sandboxed:\n${sandboxReport}`));
-  const runTool = makeToolRunner({ root, selfDir, awareness, term: headless, autoYes: opt.yes, interactive: false, shell });
+  // Nobody is there to answer, so nothing is relaxed unless asked for: careful by default, --yes for auto.
+  const runTool = makeToolRunner({ root, selfDir, awareness, term: headless, autoYes: opt.yes, approvals: resolveApprovals(opt.approvals) ?? 'careful', allowList, interactive: false, shell });
   const ac = new AbortController();
   process.on('SIGINT', () => ac.abort());
   awareness.feed('code');
@@ -241,9 +252,12 @@ if (opt.print !== undefined) {
 const term = new Terminal();
 awareness.startSession();
 let quiet = opt.quiet;
-// Session-wide auto-approve: starts from --yes, toggled with /auto. Same rails as --yes
-// (makeToolRunner still asks for destructive commands, high-risk files and unsandboxed code).
-let autoYes = opt.yes;
+// How often it asks: careful | smart | auto (see approvals.js). --yes means auto; /approvals and /auto
+// change it. In every mode makeToolRunner still asks for destructive commands, high-risk files and
+// unsandboxed code.
+let approvals = opt.yes ? 'auto' : resolveApprovals(opt.approvals) ?? DEFAULT_APPROVALS;
+const isAuto = () => approvals === 'auto';
+let lastJournal = null; // the edits of the last task that made any, for /undo
 const cooldownMs = Math.max(0, Number(opt.cooldown) || 0) * 1000;
 let lastHintAt = 0, queued = null, queueTimer = null;
 let watcher;
@@ -343,12 +357,21 @@ async function exclusive(fn) {
 const converse = (text, mode) => exclusive(async () => {
   announce(awareness.feed(mode === 'code' ? 'code' : 'ask'));
   if (mode === 'code' && cloudShell) return runCloudInTerminal(text);
-  await runAgent(agent, text, mode, { root, autoYes }, mode === 'code' ? '\n⚙  working…' : '');
+  const journal = new EditJournal();
+  await runAgent(agent, text, mode, { root, approvals: () => approvals, allowList, journal }, mode === 'code' ? '\n⚙  working…' : '');
+  noteEdits(journal);
 });
+
+function noteEdits(journal) {
+  if (!journal.entries.length) return;
+  lastJournal = journal;
+  term.print(c.dim(`  edited ${journal.files.length} file${journal.files.length === 1 ? '' : 's'}: ${journal.files.slice(0, 6).join(', ')}${journal.files.length > 6 ? ', …' : ''} · /undo puts them back`));
+}
 
 /** /code in the cloud: stream the session here; every returned change goes through local approval. */
 async function runCloudInTerminal(text) {
-  const runTool = makeToolRunner({ root, selfDir, awareness, term, autoYes, shell, signal: currentAbort.signal,
+  const journal = new EditJournal();
+  const runTool = makeToolRunner({ root, selfDir, awareness, term, approvals: () => approvals, allowList, journal, shell, signal: currentAbort.signal,
     onWrite: (rel, content) => { watcher?.noteSelfWrite(rel, content); if (path.normalize(rel) === 'AWAKEN.md') awareness.trustNotes(root, notesHash(content.slice(0, 20_000))); } });
   term.beginStream(c.cyan('\n☁  working in Claude\'s cloud sandbox…'));
   awareness.note('cloudRuns');
@@ -363,6 +386,7 @@ async function runCloudInTerminal(text) {
   } finally {
     term.write('\n');
     term.streaming = false;
+    noteEdits(journal);
   }
 }
 
@@ -405,10 +429,10 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
   // edit or command inside the fix still goes through the normal approval prompts.
   const offerFix = async (text) => {
     try {
-      if (!autoYes) {
-        const ok = await yes('  Fix it now? (each edit still shows a diff and asks)');
+      if (!isAuto()) {
+        const ok = await yes('  Fix it now? (each edit is shown as a diff; your /approvals setting decides what asks)');
         if (!ok) return term.print(c.dim('  ok — /fix later if you change your mind'));
-      } else term.print(c.dim('  /auto is on — fixing it now (destructive or high-risk steps still ask)'));
+      } else term.print(c.dim('  approvals are on auto — fixing it now (destructive or high-risk steps still ask)'));
       if (lastFinding !== text || term.busy) return; // something newer, or you started something meanwhile
       await fixFinding(text);
     } catch (e) { awareness.note('errors', `offerFix: ${e.message}`); }
@@ -450,7 +474,7 @@ const evolve = (idea) => exclusive(async () => {
   const twin = new Agent({ awareness, root: sandboxDir, selfDir, model: opt.model, fastModel: opt['fast-model'], client: agent.client, sandboxReport });
   // Edits inside the sandbox copy are auto-approved (they can't touch the live version);
   // in evolve mode the agent has no shell — only the confined run_tests tool.
-  const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandboxDir, autoWrites: true, autoCommands: autoYes }, '\n🧬 evolving…');
+  const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandboxDir, autoWrites: true, autoCommands: isAuto() }, '\n🧬 evolving…');
   if (!finished) return reject(c.dim(`  Evolution abandoned. The sandbox is left at ${sandboxDir}.`));
 
   const symlinks = [];
@@ -635,15 +659,29 @@ async function handle(line) {
     case '/fix':
       if (!lastFinding) return term.print(c.dim('  I haven\'t reported a bug on my own yet. (/code <task> to fix something specific.)'));
       return fixFinding(lastFinding);
-    case '/auto':
-      if (arg === 'on') autoYes = true;
-      else if (arg === 'off') autoYes = false;
-      else if (arg === '') autoYes = !autoYes;
-      else return term.print(c.dim('  usage: /auto [on|off]'));
-      return term.print(autoYes
-        ? c.yellow('  /auto on — I\'ll answer yes to edit and command prompts, and fix bugs I report without asking first.') +
-          c.dim(`\n  Still asks: destructive commands, high-risk files (package.json, hooks, CI, AWAKEN.md)${shell.os || shell.allowUnsandboxed ? '' : ', and code-running commands (no OS sandbox here)'}. /auto off to stop.`)
-        : c.dim('  /auto off — I\'ll ask before every change again.'));
+    case '/auto': case '/approvals': {
+      const want = cmd === '/auto' ? (arg === 'on' ? 'auto' : arg === 'off' ? DEFAULT_APPROVALS : arg === '' ? (isAuto() ? DEFAULT_APPROVALS : 'auto') : null) : (arg ? resolveApprovals(arg) : approvals);
+      if (!want) return term.print(c.dim(cmd === '/auto' ? '  usage: /auto [on|off]' : `  usage: /approvals <${APPROVAL_MODES.map((m) => m.id).join('|')}>`));
+      const facts = { ...sandboxFacts(shell), unsandboxedOk: Boolean(shell.allowUnsandboxed) };
+      if (cmd === '/approvals' && !arg) {
+        return term.print(APPROVAL_MODES.map((m) => `  ${m.id === approvals ? c.green('✓') : ' '} ${m.id.padEnd(8)} ${c.dim(`${m.label}: ${m.note}`)}`).join('\n') + '\n' + c.dim(`  ${describeApprovals(approvals, facts)}`));
+      }
+      approvals = want;
+      return term.print((isAuto() ? c.yellow : c.cyan)(`  Approvals: ${approvalsLabel(approvals)}.`) + c.dim(`\n  ${describeApprovals(approvals, facts)}${isAuto() ? '\n  I\'ll also fix bugs I report without asking first. /auto off to stop.' : ''}`));
+    }
+    case '/allowed': {
+      if (arg === 'clear') allowList.remove(root);
+      else if (/^(remove|rm)\s+\S/.test(arg)) allowList.remove(root, arg.replace(/^(remove|rm)\s+/, ''));
+      else if (arg) return term.print(c.dim('  usage: /allowed [clear | remove N]'));
+      const l = allowList.list(root);
+      return term.print(l.length ? c.dim('  Always allowed in this project:\n') + l.map((x, i) => `  ${i + 1}. ${x}`).join('\n') + c.dim('\n  /allowed remove N · /allowed clear') : c.dim('  No commands are always allowed here. When a command asks, answer "a" to always allow that exact command in this project.'));
+    }
+    case '/undo': {
+      if (!lastJournal?.entries.length) return term.print(c.dim('  Nothing to undo: the last task made no edits with its file tools.'));
+      const r = await lastJournal.undo({ onWrite: (rel, content) => watcher?.noteSelfWrite(rel, content) });
+      lastJournal = null;
+      return term.print([r.restored.length && `  put back: ${r.restored.join(', ')}`, r.removed.length && `  removed (it had created them): ${r.removed.join(', ')}`, r.skipped.length && c.yellow(`  left alone because they changed since: ${r.skipped.join(', ')}`)].filter(Boolean).join('\n') || c.dim('  Nothing to undo.'));
+    }
     case '/cost':
       return term.print(meter.report(modelLabel).replace(/^/gm, '  '));
     case '/budget': {
@@ -705,6 +743,7 @@ console.log([
   awareness.state.sessions > 1 && awareness.stageIndex >= 1 ? c.magenta('  (it seems to remember you)') : '',
   c.dim(`  watching ${root} · ${watcher.fileCount()} files · ${awareness.describe()}`),
   c.dim('  save a file for hints · type to ask · /code <task> to build · /help'),
+  c.dim(`  approvals: ${approvalsLabel(approvals).toLowerCase()} · /approvals to change`),
   cloudShell ? c.dim("  ☁  /code runs in Claude's cloud sandbox (Managed Agents) · --shell local to run here") : '',
   isFullySandboxed(sandbox)
     ? c.dim(`  🔒 sandboxed: own process confined · commands in ${sandbox.os.kind === 'sbx' ? 'a Docker Sandbox microVM' : sandbox.os.kind}${sandbox.os.kind === 'sbx' ? '' : opt.net ? ' (network on)' : ', no network'} · /sandbox`)

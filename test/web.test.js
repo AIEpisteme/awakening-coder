@@ -337,3 +337,91 @@ test('with auto-approve off, an unsandboxed command still asks', async () => {
     await s.waitFor((e) => e.type === 'done');
   } finally { s.stop(); }
 });
+
+// ---------- fewer, better approval prompts ----------
+test('smart approvals: one click covers the rest of a task\'s edits, and Undo puts them back', async () => {
+  const s = await start({ app: { makeAgent: scriptedAgent([['write_file', { path: 'a.txt', content: 'a\n' }], ['write_file', { path: 'b.txt', content: 'b\n' }], ['write_file', { path: 'package.json', content: '{}\n' }]]) } });
+  try {
+    assert.equal(s.app.state().approvals, 'smart', 'smart is the default');
+    await s.call('/api/message', { body: { text: 'go', mode: 'code' } });
+    const q = await s.waitFor((e) => e.type === 'question');
+    assert.deepEqual(q.choices, ['y', 'task', 'n']);
+    await s.call('/api/answer', { body: { id: q.id, answer: 'task' } });
+    assert.equal((await s.waitFor((e) => e.type === 'answered' && e.id === q.id)).answer, 'task');
+    // b.txt goes through; the high-risk file still asks, with no wider grant on offer.
+    const risky = await s.waitFor((e) => e.type === 'question' && e.id !== q.id);
+    assert.equal(risky.kind, 'risky');
+    assert.deepEqual(risky.choices, ['y', 'n']);
+    assert.match(risky.why, /always asks/);
+    assert.equal(fs.readFileSync(path.join(s.root, 'b.txt'), 'utf8'), 'b\n');
+    await s.call('/api/answer', { body: { id: risky.id, answer: 'n' } });
+    const done = await s.waitFor((e) => e.type === 'done');
+    assert.deepEqual(done.edited, ['a.txt', 'b.txt']);
+    assert.equal(s.app.state().canUndo, true);
+    const undone = await (await s.call('/api/undo', { body: {} })).json();
+    assert.deepEqual(undone.removed, ['a.txt', 'b.txt']);
+    assert.ok(!fs.existsSync(path.join(s.root, 'a.txt')) && !fs.existsSync(path.join(s.root, 'b.txt')));
+    assert.equal((await s.call('/api/undo', { body: {} })).status, 400, 'nothing left to undo');
+  } finally { s.stop(); }
+});
+
+test('approvals setting: three modes, remembered across restarts, but Auto is never restored', async () => {
+  const stateDir = tmp();
+  const s = await start({ app: { stateDir } });
+  try {
+    assert.deepEqual(s.app.state().approvalModes.map((m) => m.id), ['careful', 'smart', 'auto']);
+    assert.equal((await s.call('/api/approvals', { body: { mode: 'yolo' } })).status, 400);
+    const r = await (await s.call('/api/approvals', { body: { mode: 'careful' } })).json();
+    assert.equal(r.approvals, 'careful');
+    assert.match(r.changed, /Ask every time/);
+  } finally { s.stop(); }
+  const again = await start({ app: { stateDir } });
+  try {
+    assert.equal(again.app.state().approvals, 'careful', 'remembered');
+    await again.call('/api/auto', { body: { on: true } }); // the old switch still works
+    assert.equal(again.app.state().approvals, 'auto');
+    assert.equal(again.app.autoYes, true);
+  } finally { again.stop(); }
+  const third = await start({ app: { stateDir } });
+  try { assert.equal(third.app.state().approvals, 'smart', 'Auto has to be chosen again each session'); } finally { third.stop(); }
+  const flagged = await start({ app: { stateDir, settings: { model: 'claude-opus-5-5', effort: 'high', approvals: 'auto' } } });
+  try { assert.equal(flagged.app.state().approvals, 'auto', 'an explicit --approvals flag wins'); } finally { flagged.stop(); }
+});
+
+test('careful mode asks about every edit, with only yes or no', async () => {
+  const s = await start({ app: { settings: { model: 'claude-opus-5-5', effort: 'high', approvals: 'careful' }, makeAgent: scriptedAgent([['write_file', { path: 'a.txt', content: 'a\n' }], ['write_file', { path: 'b.txt', content: 'b\n' }]]) } });
+  try {
+    await s.call('/api/message', { body: { text: 'go', mode: 'code' } });
+    const q1 = await s.waitFor((e) => e.type === 'question');
+    assert.deepEqual(q1.choices, ['y', 'n']);
+    await s.call('/api/answer', { body: { id: q1.id, answer: 'task' } }); // not on offer here: counts as no
+    const q2 = await s.waitFor((e) => e.type === 'question' && e.id !== q1.id);
+    await s.call('/api/answer', { body: { id: q2.id, answer: 'y' } });
+    await s.waitFor((e) => e.type === 'done');
+    assert.ok(!fs.existsSync(path.join(s.root, 'a.txt')));
+    assert.ok(fs.existsSync(path.join(s.root, 'b.txt')));
+  } finally { s.stop(); }
+});
+
+test('"Always allow in this project" remembers one exact command; a page that connects late still gets the full question', SPAWNS, async () => {
+  const s = await start({ app: { shell: { os: null }, makeAgent: scriptedAgent([['run_command', { command: 'node ok.js' }], ['run_command', { command: 'node ok.js' }]]) } });
+  try {
+    fs.writeFileSync(path.join(s.root, 'ok.js'), "console.log('ran');\n");
+    await s.call('/api/message', { body: { text: 'go', mode: 'code' } });
+    const q = await s.waitFor((e) => e.type === 'question');
+    assert.deepEqual(q.choices, ['y', 'always', 'n']);
+    assert.match(q.why, /your own access/);
+    // A second browser tab opening now sees the same question, choices included.
+    const late = await fetch(`${s.base}/events?t=${s.app.token}`);
+    const reader = late.body.getReader(); let buf = '';
+    while (!/"type":"question"/.test(buf)) buf += Buffer.from((await reader.read()).value).toString('utf8');
+    await reader.cancel();
+    assert.match(buf, new RegExp(`"id":"${q.id}".*"choices":\\["y","always","n"\\]`));
+    await s.call('/api/answer', { body: { id: q.id, answer: 'always' } });
+    await s.waitFor((e) => e.type === 'done');
+    assert.equal(s.events.filter((e) => e.type === 'question').length, 1, 'the second run of the same command did not ask');
+    assert.deepEqual(s.app.state().allowed, ['node ok.js']);
+    const st = await (await s.call('/api/allowed', { body: { remove: 1 } })).json();
+    assert.deepEqual(st.allowed, []);
+  } finally { s.stop(); }
+});
