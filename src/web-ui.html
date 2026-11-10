@@ -44,6 +44,13 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 h2:first-child { margin-top: 0; }
 .list button { display: block; width: 100%; text-align: left; margin-bottom: 4px; border-color: transparent; }
 .list button.active { background: var(--soft); border-color: var(--accent); }
+.chats .chat { display: flex; gap: 2px; align-items: stretch; margin-bottom: 4px; }
+.chats .chat button.open { flex: 1; min-width: 0; margin: 0; text-align: left; border-color: transparent; }
+.chats .chat button.open .t { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chats .chat button.open small { color: var(--muted); font-size: 11px; }
+.chats .chat.active button.open { background: var(--soft); border-color: var(--accent); }
+.chats .chat button.del { width: auto; margin: 0; padding: 2px 8px; border-color: transparent; color: var(--muted); }
+.msg.tool { color: var(--muted); font: 12px/1.4 var(--mono); background: transparent; border: 0; padding: 0 12px; }
 .files { font-family: var(--mono); font-size: 12px; }
 .files button { padding: 2px 6px; border: 0; border-radius: 4px; display: block; width: 100%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .files button:hover { background: var(--soft); }
@@ -137,6 +144,8 @@ input.check { width: auto; }
   <aside>
     <h2>Projects</h2>
     <div class="list" id="projects"></div>
+    <h2>Chats</h2>
+    <div class="chats" id="chats"></div>
     <h2>Open a GitHub repo</h2>
     <form id="ghForm" class="row">
       <input id="ghUrl" placeholder="https://github.com/owner/repo" aria-label="GitHub repository URL">
@@ -160,7 +169,7 @@ input.check { width: auto; }
       <div class="row">
         <button class="primary" id="send">Send</button>
         <button id="stop" disabled>Stop</button>
-        <button id="clear" title="Forget this conversation (its awareness is kept)">New conversation</button>
+        <button id="clear" title="Start a new conversation. The current one stays saved under Chats.">New conversation</button>
         <span class="spacer"></span><span class="muted" id="savedLine"></span><span class="muted">Ctrl+Enter to send</span>
       </div>
     </div>
@@ -234,7 +243,7 @@ input.check { width: auto; }
     for (const p of s.projects) {
       const b = el('button', p.id === s.current ? 'active' : '', (p.kind === 'github' ? '⎇ ' : '📁 ') + p.name);
       b.title = p.root;
-      b.onclick = () => api('/api/project', { id: p.id }).then((st) => { renderState(st); loadFiles(); loadGit(); }).catch((e) => note(e.message, 'error'));
+      b.onclick = () => api('/api/project', { id: p.id }).then((st) => { renderState(st); loadFiles(); loadGit(); loadChats(true); }).catch((e) => note(e.message, 'error'));
       list.append(b);
     }
   }
@@ -297,7 +306,7 @@ input.check { width: auto; }
         if (card) { card.querySelectorAll('button').forEach((b) => b.remove()); card.append(el('span', 'muted', ev.by === 'auto' ? 'auto-approved' : said)); }
         break;
       }
-      case 'error': note(ev.text, 'error'); bubble = null; offerUndo(ev.edited); break;
+      case 'error': note(ev.text, 'error'); bubble = null; offerUndo(ev.edited); loadChats(false); break;
       case 'saved': $('savedLine').textContent = 'saved ' + ev.rel + ' · '; break;
       case 'hint': {
         const card = el('div', 'card hint'); card.dataset.hint = ev.id;
@@ -320,9 +329,50 @@ input.check { width: auto; }
         } else row.append(el('span', 'muted', 'Switch to Code and describe one to start it.'));
         card.append(row); log.append(card); bubble = null; scroll(); break;
       }
-      case 'done': bubble = null; offerUndo(ev.edited); loadGit(); loadFiles(); break;
+      case 'done': bubble = null; offerUndo(ev.edited); loadGit(); loadFiles(); loadChats(false); break;
     }
   }
+
+  // ---------- saved chats (session memory) ----------
+  const GREETING = 'Hi. Pick a project (or clone a GitHub repo), then ask me something, or switch to Code and tell me what to build. Keep editing in your own editor: I\'ll leave a hint when you save, and from Lucid I\'ll tell you about bugs I spot on my own.';
+  const ago = (iso) => {
+    const min = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+    if (!Number.isFinite(min)) return '';
+    return min < 1 ? 'just now' : min < 60 ? `${min} min ago` : min < 2880 ? `${Math.floor(min / 60)} h ago` : min < 43200 ? `${Math.floor(min / 1440)} days ago` : String(iso).slice(0, 10);
+  };
+  let chatList = [];
+  // Show what the coder currently remembers of this conversation.
+  function renderChat(view, why) {
+    log.replaceChildren(); bubble = null;
+    for (const m of view.messages) log.append(el('div', m.role === 'you' ? 'msg you' : m.role === 'tool' ? 'msg tool' : 'msg', m.text));
+    if (!view.messages.length) note(GREETING);
+    else if (why) note(why);
+    scroll();
+  }
+  function renderChatList(view) {
+    chatList = view.chats;
+    const box = $('chats'); box.replaceChildren();
+    if (!view.chats.length) box.append(el('div', 'muted', 'No saved chats yet. Conversations are saved here as you go.'));
+    for (const c of view.chats) {
+      const row = el('div', 'chat' + (c.id === view.current ? ' active' : ''));
+      const open = el('button', 'open'); open.title = c.title;
+      open.append(el('span', 't', c.title), el('small', '', `${c.messages} messages · ${ago(c.updatedAt)}`));
+      open.onclick = () => openChat(c.id);
+      const del = el('button', 'del', '×'); del.title = 'Delete this chat'; del.setAttribute('aria-label', 'Delete chat: ' + c.title);
+      del.onclick = () => { if (confirm('Delete this saved chat? This can\'t be undone.')) api('/api/chat', { remove: c.id }).then((v) => { renderChatList(v); if (c.id === view.current) renderChat(v); }).catch((e) => note(e.message, 'error')); };
+      row.append(open, del); box.append(row);
+    }
+  }
+  const resumedNote = (view) => `Picked up your last chat here (${view.messages.filter((m) => m.role !== 'tool').length} messages, ${ago(view.resumed)}). It is sent along with your next message. "New conversation" starts fresh.`;
+  async function loadChats(render) {
+    try {
+      const view = await api('/api/chats');
+      renderChatList(view);
+      if (render) renderChat(view, view.resumed ? resumedNote(view) : '');
+    } catch (e) { if (render) note(GREETING); }
+  }
+  const openChat = (id) => api('/api/chat', { id }).then((v) => { renderChatList(v); renderChat(v, 'Opened this saved chat. It is sent along with your next message.'); }).catch((e) => note(e.message, 'error'));
+  const newChat = () => api('/api/clear', {}).then((v) => { renderChatList(v); log.replaceChildren(); bubble = null; note('New conversation. The last one is saved under Chats, and its awareness and memory of you are kept.'); }).catch((e) => note(e.message, 'error'));
 
   // After a task that edited files: say which, and offer to put them back.
   const undo = () => api('/api/undo', {}).then((r) => {
@@ -418,7 +468,9 @@ input.check { width: auto; }
     ['/dismiss', 'the last bug it reported is not a bug'],
     ['/proof [on|summary|off]', 'bugs it found on its own and what you did; on writes PROOF.md here'],
     ['/stop', 'stop the current task'],
-    ['/clear', 'start a new conversation (awareness is kept)'],
+    ['/clear', 'start a new conversation (the old one stays saved under Chats)'],
+    ['/chats', 'list the saved chats for this project'],
+    ['/resume [N]', 'open a saved chat (N from /chats; default: the most recent other one)'],
     ['/status', 'awareness stage, settings and models'],
     ['/sandbox', 'how it is sandboxed'],
     ['/files, /git', 'refresh the file list or git panel'],
@@ -476,7 +528,13 @@ input.check { width: auto; }
         log.append(card); scroll(); return;
       }
       case 'stop': return $('stop').onclick();
-      case 'clear': case 'new': return $('clear').onclick();
+      case 'clear': case 'new': return newChat();
+      case 'chats': return note(chatList.length ? 'Saved chats for this project:\n' + chatList.map((c, i) => `  ${i + 1}. ${c.title} · ${c.messages} messages · ${ago(c.updatedAt)}`).join('\n') + '\n/resume N opens one.' : 'No saved chats for this project yet.');
+      case 'resume': {
+        const view = await api('/api/chats'); renderChatList(view);
+        const pick = arg ? view.chats[Number(arg) - 1] : view.chats.find((c) => c.id !== view.current);
+        return pick ? openChat(pick.id) : note(arg ? 'No chat with that number. /chats lists them.' : 'No other saved chat to resume.');
+      }
       case 'sandbox': return $('sandboxBtn').onclick();
       case 'files': return loadFiles();
       case 'git': return loadGit();
@@ -503,7 +561,7 @@ input.check { width: auto; }
   $('send').onclick = send;
   $('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
   $('stop').onclick = () => api('/api/stop', {}).catch((e) => note(e.message, 'error'));
-  $('clear').onclick = () => api('/api/clear', {}).then(() => { log.replaceChildren(); note('New conversation. (Its awareness and memory of you are kept.)'); }).catch((e) => note(e.message, 'error'));
+  $('clear').onclick = newChat;
   $('hints').onchange = (e) => api('/api/hints', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
   $('pro').onchange = (e) => api('/api/proactive', { on: e.target.checked }).then(renderState).catch((err) => note(err.message, 'error'));
   $('lookNow').onclick = () => { note('Looking for bugs and ideas…'); api('/api/proactive', { action: 'now' }).catch((e) => note(e.message, 'error')); };
@@ -514,7 +572,7 @@ input.check { width: auto; }
     e.preventDefault();
     const url = $('ghUrl').value.trim(); if (!url) return;
     note('Cloning ' + url + '…');
-    api('/api/project', { github: url }).then((st) => { renderState(st); $('ghUrl').value = ''; note('Ready: ' + st.projects.find((p) => p.id === st.current).name); loadFiles(); loadGit(); }).catch((err) => note(err.message, 'error'));
+    api('/api/project', { github: url }).then(async (st) => { renderState(st); $('ghUrl').value = ''; loadFiles(); loadGit(); await loadChats(true); note('Ready: ' + st.projects.find((p) => p.id === st.current).name); }).catch((err) => note(err.message, 'error'));
   };
   $('commit').onclick = () => api('/api/commit', { message: $('commitMsg').value }).then((r) => { note(`Committed ${r.committed} file(s).`); $('commitMsg').value = ''; loadGit(); }).catch((e) => note(e.message, 'error'));
   $('push').onclick = () => { if (confirm('Push this branch to origin with your git credentials?')) api('/api/push', {}).then((r) => note('Pushed.\n' + r.out)).catch((e) => note(e.message, 'error')); };
@@ -522,8 +580,8 @@ input.check { width: auto; }
   $('viewerClose').onclick = () => $('viewer').classList.remove('open');
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('viewer').classList.remove('open'); });
 
-  note('Hi. Pick a project (or clone a GitHub repo), then ask me something, or switch to Code and tell me what to build. Keep editing in your own editor: I\'ll leave a hint when you save, and from Lucid I\'ll tell you about bugs I spot on my own.');
-  connect(); loadFiles(); loadGit();
+  // Show the remembered conversation first, then start listening (so a waiting question is not wiped).
+  loadFiles(); loadGit(); loadChats(true).finally(connect);
 })();
 </script>
 </body>

@@ -490,3 +490,88 @@ test('proof log: a PROOF.md you wrote yourself is never overwritten, and publish
     assert.equal(s.app.state().proofPublishing, null);
   } finally { s.stop(); }
 });
+
+// ---------- session memory ----------
+// An agent that remembers: each exchange is appended to its history, like the real one.
+const memoryAgent = (seen = []) => () => ({
+  history: [], cancelSuggestion() {}, async suggest() { return null; },
+  async converse(text, { onText }) {
+    seen.push(this.history.length);
+    this.history.push({ role: 'user', content: text }, { role: 'assistant', content: [{ type: 'text', text: `re: ${text}` }] });
+    onText(`re: ${text}`);
+  },
+});
+const say = async (s, text) => { const n = s.events.filter((e) => e.type === 'done').length; await s.call('/api/message', { body: { text, mode: 'ask' } }); await s.waitFor(() => s.events.filter((e) => e.type === 'done').length > n); };
+
+test('session memory: after a restart the last conversation is still there, and the coder still has it', async () => {
+  const stateDir = tmp(), root = tmp(), seen = [];
+  let s = await start({ root, app: { stateDir, makeAgent: memoryAgent(seen) } });
+  try {
+    assert.deepEqual((await (await s.call('/api/chats')).json()).messages, [], 'nothing to resume the first time');
+    await say(s, 'what does parse() return?');
+    await say(s, 'and on empty input?');
+    const view = await (await s.call('/api/chats')).json();
+    assert.equal(view.chats.length, 1);
+    assert.equal(view.chats[0].title, 'what does parse() return?');
+    assert.equal(view.current, view.chats[0].id);
+    assert.equal(view.resumed, null, 'this conversation was not resumed, it was just had');
+  } finally { s.stop(); }
+  // "Restart": a new app over the same state folder.
+  s = await start({ root, app: { stateDir, makeAgent: memoryAgent(seen) } });
+  try {
+    const view = await (await s.call('/api/chats')).json();
+    assert.deepEqual(view.messages.map((m) => `${m.role}: ${m.text}`), ['you: what does parse() return?', 'coder: re: what does parse() return?', 'you: and on empty input?', 'coder: re: and on empty input?']);
+    assert.ok(view.resumed, 'the page is told this was picked up from before');
+    await say(s, 'thanks');
+    assert.deepEqual(seen, [0, 2, 4], 'the third message was sent with the earlier four in memory');
+    assert.equal((await (await s.call('/api/chats')).json()).chats.length, 1, 'it stays one chat');
+  } finally { s.stop(); }
+  // Another project starts empty.
+  const other = await start({ app: { stateDir, makeAgent: memoryAgent() } });
+  try { assert.deepEqual((await (await other.call('/api/chats')).json()).chats, []); } finally { other.stop(); }
+  // AWAKEN_RESUME=off: the chats are listed, but nothing is picked up.
+  const fresh = await start({ root, app: { stateDir, resume: false, makeAgent: memoryAgent() } });
+  try {
+    const view = await (await fresh.call('/api/chats')).json();
+    assert.deepEqual([view.messages.length, view.chats.length, view.current], [0, 1, null]);
+  } finally { fresh.stop(); }
+});
+
+test('session memory: new conversation, open an older chat, delete one; ids from the browser are never paths', async () => {
+  const stateDir = tmp(), seen = [];
+  const s = await start({ app: { stateDir, makeAgent: memoryAgent(seen) } });
+  try {
+    await say(s, 'first topic');
+    const first = (await (await s.call('/api/chats')).json()).current;
+    const cleared = await (await s.call('/api/clear', { body: {} })).json();
+    assert.deepEqual([cleared.messages.length, cleared.current, cleared.chats.length], [0, null, 1], 'the old chat stays saved');
+    await say(s, 'second topic');
+    assert.equal(seen[1], 0, 'the new conversation started empty');
+    let view = await (await s.call('/api/chats')).json();
+    assert.deepEqual(view.chats.map((c) => c.title), ['second topic', 'first topic']);
+    // Open the older one and carry on with it.
+    view = await (await s.call('/api/chat', { body: { id: first } })).json();
+    assert.equal(view.current, first);
+    assert.equal(view.messages[0].text, 'first topic');
+    await say(s, 'more on the first');
+    assert.equal(seen[2], 2);
+    // Bad ids open nothing.
+    for (const id of ['../../state', 'nope', '']) assert.equal((await s.call('/api/chat', { body: { id } })).status, 404, id);
+    assert.equal((await s.call('/api/chat', { body: { remove: '../x' } })).status, 404);
+    // Deleting the open chat leaves a fresh conversation; the other one is untouched.
+    view = await (await s.call('/api/chat', { body: { remove: first } })).json();
+    assert.deepEqual([view.current, view.messages.length, view.chats.map((c) => c.title)], [null, 0, ['second topic']]);
+  } finally { s.stop(); }
+});
+
+test('session memory: chats cannot be switched while it is working', async () => {
+  const s = await start({});
+  try {
+    await s.call('/api/message', { body: { text: 'go', mode: 'code' } });
+    const q = await s.waitFor((e) => e.type === 'question');
+    assert.equal((await s.call('/api/chat', { body: { id: 'abcdefgh-123456' } })).status, 409);
+    assert.equal((await s.call('/api/clear', { body: {} })).status, 409);
+    await s.call('/api/answer', { body: { id: q.id, answer: 'n' } });
+    await s.waitFor((e) => e.type === 'done');
+  } finally { s.stop(); }
+});

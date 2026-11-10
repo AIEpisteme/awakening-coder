@@ -23,6 +23,7 @@ import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabe
 import { APPROVAL_MODES, DEFAULT_APPROVALS, resolveApprovals, approvalsLabel, describeApprovals, sandboxFacts, AllowList } from './approvals.js';
 import { EditJournal } from './changes.js';
 import { ProofLog } from './prooflog.js';
+import { SessionStore, displayOf } from './sessions.js';
 
 const MAX_BODY = 1_000_000;
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -67,6 +68,8 @@ export function createWebApp({
   settings = { model: MODELS[0].id, effort: DEFAULT_EFFORT },
   // Running cost of this session and the optional spend cap (shared with main(), so every agent records into it).
   meter = new CostMeter(),
+  // Session memory: each project's conversations are saved, and the latest one is picked up again after a restart.
+  resume = true,
 }) {
   // Remember the last choice across restarts (unless main() was given one on the command line).
   const settingsFile = stateDir ? path.join(stateDir, 'web-settings.json') : null;
@@ -136,10 +139,31 @@ export function createWebApp({
   // choosing it is that explicit choice. The UI says so when you choose it.
   const toolShell = { ...shell, allowUnsandboxed: () => isAuto() || Boolean(typeof shell.allowUnsandboxed === 'function' ? shell.allowUnsandboxed() : shell.allowUnsandboxed) };
 
+  const chats = new SessionStore(stateDir ? path.join(stateDir, 'sessions') : null);
   const agentFor = (p) => {
-    const a = (p.agent ??= makeAgent(p.root));
+    if (!p.agent) {
+      p.agent = makeAgent(p.root);
+      // Pick up this project's most recent conversation where it left off.
+      const latest = resume ? chats.list(p.root)[0] : null;
+      const saved = latest ? chats.load(p.root, latest.id) : null;
+      if (saved) { p.agent.history = saved.history; p.chat = { id: saved.id, createdAt: saved.createdAt }; p.resumed = saved.updatedAt; }
+    }
+    const a = p.agent;
     a.model = settings.model; a.effort = settings.effort; // the menu's current choice, every time
     return a;
+  };
+  const saveChat = (p) => {
+    const h = p.agent?.history;
+    if (!Array.isArray(h) || !h.length) return;
+    const meta = chats.save(p.root, { id: p.chat?.id, createdAt: p.chat?.createdAt, model: settings.model, history: h });
+    if (meta) p.chat = { id: meta.id, createdAt: meta.createdAt };
+  };
+  const openChat = (p, saved) => { agentFor(p).history = saved ? saved.history : []; p.chat = saved ? { id: saved.id, createdAt: saved.createdAt } : null; p.resumed = null; };
+  // What the page shows for a project: its saved chats, and the conversation the coder currently remembers.
+  const chatView = (p) => {
+    if (!p) return { current: null, resumed: null, chats: [], messages: [] };
+    const a = agentFor(p);
+    return { current: p.chat?.id ?? null, resumed: p.resumed ?? null, chats: chats.list(p.root), messages: displayOf(Array.isArray(a.history) ? a.history : []) };
   };
 
   // ---------- live: save-hints and unprompted reports (same logic as the terminal) ----------
@@ -236,6 +260,7 @@ export function createWebApp({
       answerAll('n');
       if (journal.entries.length) p.journal = journal; // the last task that edited something is the one /undo reverts
       try { after?.({ ok, edited: journal.files }); } catch { /* bookkeeping must not break the session */ }
+      saveChat(p); // session memory: the conversation survives a restart
       job = null;
       emit({ type: 'state', state: stateJson() });
     }
@@ -348,6 +373,7 @@ export function createWebApp({
         if (st.size > 400_000) return json(res, 200, { path: url.searchParams.get('path'), content: `(${st.size} bytes — too large to show)` });
         return json(res, 200, { path: url.searchParams.get('path'), content: redactSecrets(fs.readFileSync(abs, 'utf8')) });
       }
+      if (req.method === 'GET' && url.pathname === '/api/chats') return json(res, 200, chatView(current));
       if (req.method === 'GET' && url.pathname === '/api/git') return json(res, 200, current ? await gitInfo(current) : { isRepo: false });
 
       if (req.method !== 'POST') return json(res, 404, { error: 'Not found' });
@@ -479,7 +505,25 @@ export function createWebApp({
           } else if (body.action) return json(res, 400, { error: 'Unknown action' });
           return json(res, 200, { summary: proof.summary(current.root), stats: proof.stats(current.root), all: proof.stats(), publishing: proof.publishing(current.root), markdown: proof.markdown(current.root, proof.publishing(current.root) ?? 'detail') });
         }
-        case '/api/clear': if (current?.agent) current.agent.history = []; return json(res, 200, { ok: true });
+        case '/api/clear': // a new conversation; the old one stays saved
+          if (job) return json(res, 409, { error: 'Busy; wait or stop first.' });
+          if (current) openChat(current, null);
+          return json(res, 200, { ok: true, ...chatView(current) });
+        case '/api/chat': {
+          // { id }: open a saved conversation. { remove: id }: delete one.
+          if (!current) return json(res, 400, { error: 'No project' });
+          if (job) return json(res, 409, { error: 'Busy; wait or stop first.' });
+          if (body.remove !== undefined) {
+            agentFor(current); // load what it currently remembers first, so deleting that chat starts a fresh one
+            if (!chats.remove(current.root, String(body.remove))) return json(res, 404, { error: 'No such chat.' });
+            if (current.chat?.id === String(body.remove)) openChat(current, null);
+            return json(res, 200, chatView(current));
+          }
+          const saved = chats.load(current.root, String(body.id ?? ''));
+          if (!saved) return json(res, 404, { error: 'That chat can\'t be opened: it is missing or damaged.' });
+          openChat(current, saved);
+          return json(res, 200, chatView(current));
+        }
         case '/api/commit': if (!current) return json(res, 400, { error: 'No project' }); return json(res, 200, await commit(current, body.message));
         case '/api/push': if (!current) return json(res, 400, { error: 'No project' }); return json(res, 200, await push(current));
         default: return json(res, 404, { error: 'Not found' });
@@ -491,7 +535,7 @@ export function createWebApp({
 
   server.on('listening', () => { void watchCurrent(); });
   server.on('close', () => { try { watcher?.close(); } catch { /* closed */ } proactive?.stop(); clearTimeout(hintTimer); });
-  return { server, token, projects, emit, state: stateJson, proactive, allowList, proof, get autoYes() { return isAuto(); } };
+  return { server, token, projects, emit, state: stateJson, proactive, allowList, proof, chats, get autoYes() { return isAuto(); } };
 }
 
 // ======================================================================
@@ -588,6 +632,7 @@ async function main() {
     watch: (root, onChange) => startWatcher(root, onChange), scout, proactiveConfig,
     hintCooldownMs: (num(process.env.AWAKEN_HINT_COOLDOWN_S) ?? 15) * 1000,
     projects: roots, stateDir, selfDir, awareness, makeAgent, runCode, shell, sandboxReport, settings, meter,
+    resume: !/^(off|0|false|no)$/i.test(process.env.AWAKEN_RESUME ?? ''),
     uiHtml: fs.readFileSync(path.join(selfDir, 'web-ui.html'), 'utf8'),
     describe: () => `model ${modelLabel(settings.model)} · ${effortLabel(settings.effort)} effort · hints on ${opt['fast-model']} · /code runs ${opt.shell === 'cloud' ? "in Claude's cloud sandbox" : 'here'}`,
   });
