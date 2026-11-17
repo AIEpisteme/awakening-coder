@@ -346,6 +346,8 @@ test('the web app starts when launched through a symlink, as npm\'s bin link doe
   const { spawnSync } = await import('node:child_process');
   const r = spawnSync(process.execPath, [link, '--help'], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, AWAKENING_HOME: dir } });
   assert.match(r.stdout + r.stderr, /awaken-web/, 'it printed its help instead of exiting silently');
+});
+
 // ---------- fewer, better approval prompts ----------
 test('smart approvals: one click covers the rest of a task\'s edits, and Undo puts them back', async () => {
   const s = await start({ app: { makeAgent: scriptedAgent([['write_file', { path: 'a.txt', content: 'a\n' }], ['write_file', { path: 'b.txt', content: 'b\n' }], ['write_file', { path: 'package.json', content: '{}\n' }]]) } });
