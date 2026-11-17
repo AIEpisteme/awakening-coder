@@ -416,6 +416,7 @@ async function main() {
 
   const selfDir = path.dirname(fileURLToPath(import.meta.url));
   const selfRoot = path.join(selfDir, '..');
+  loadDotEnv(path.join(homeDir(), '.env')); // npm installs keep the key here; a checkout's own .env wins
   loadDotEnv(path.join(selfRoot, '.env'));
 
   const { values: opt, positionals } = parseArgs({
@@ -440,7 +441,7 @@ async function main() {
   you paste in the UI (cloned into ${path.join(homeDir(), 'repos')}). Listens on 127.0.0.1 only.`);
     process.exit(0);
   }
-  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) { console.error(c.red('Set ANTHROPIC_API_KEY (environment or .env next to package.json).')); process.exit(1); }
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) { console.error(c.red('No API key. Set ANTHROPIC_API_KEY in your environment, or put ANTHROPIC_API_KEY=sk-ant-... in ' + path.join(homeDir(), '.env'))); process.exit(1); }
   const roots = (positionals.length ? positionals : [process.cwd()]).map((p) => path.resolve(p));
   for (const r of roots) { let ok = false; try { ok = fs.statSync(r).isDirectory(); } catch { /* missing */ } if (!ok) { console.error(c.red(`Not a folder: ${r}`)); process.exit(1); } }
   const stateDir = homeDir();
@@ -511,4 +512,6 @@ async function main() {
   process.on('unhandledRejection', (e) => console.error(c.red(`error: ${e?.message ?? e}`) + (explainApiError(e) ? '\n' + explainApiError(e) : '')));
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
+// Run when started directly, including through npm's bin link (a symlink on macOS and Linux).
+const startedDirectly = () => { try { return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } };
+if (process.argv[1] && startedDirectly()) main();

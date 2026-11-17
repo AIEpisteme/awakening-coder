@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createWebApp, parseGithubUrl } from '../src/web.js';
@@ -336,4 +337,13 @@ test('with auto-approve off, an unsandboxed command still asks', async () => {
     await s.call('/api/answer', { body: { id: q.id, answer: 'n' } });
     await s.waitFor((e) => e.type === 'done');
   } finally { s.stop(); }
+});
+
+test('the web app starts when launched through a symlink, as npm\'s bin link does', SPAWNS, async () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'weblink-')));
+  const link = path.join(dir, 'awaken-web');
+  fs.symlinkSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'web.js'), link);
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync(process.execPath, [link, '--help'], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, AWAKENING_HOME: dir } });
+  assert.match(r.stdout + r.stderr, /awaken-web/, 'it printed its help instead of exiting silently');
 });

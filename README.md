@@ -2,6 +2,49 @@
 
 A small tool about code suggestions.
 
+## Quick start
+
+You need [Node.js](https://nodejs.org) 22 or newer and an [Anthropic API key](https://console.anthropic.com/settings/keys).
+
+**1. Install**
+
+```bash
+npm install -g awakening-coder
+```
+
+**2. Give it your API key**
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...             # macOS / Linux
+```
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."           # Windows PowerShell
+```
+
+To save the key so you don't set it each time, put the line `ANTHROPIC_API_KEY=sk-ant-...` in a file named `.env` in the `.awakening-coder` folder in your home folder (`~/.awakening-coder/.env`, or `C:\Users\you\.awakening-coder\.env`).
+
+**3. Run it on a project**
+
+```bash
+awakening-coder /path/to/your/project           # terminal app
+awaken-web /path/to/your/project --open         # web app in your browser
+```
+
+On Windows, put paths with spaces in quotes: `awakening-coder "C:\Users\you\My Project"`.
+
+**Without a global install:** `npx awakening-coder .` runs the terminal app, and `npx -p awakening-coder awaken-web . --open` runs the web app.
+
+| Problem | Fix |
+|---|---|
+| `awakening-coder` is not recognized | You installed without `-g`. Run `npm install -g awakening-coder`, or put `npx` in front of the command. |
+| `could not determine executable to run` | You have version 1.0.0. Run `npm install -g awakening-coder@latest`. |
+| It exits with a Node version error | Update to Node.js 22 or newer (`node --version` shows yours). |
+| `No API key` | Do step 2 in the same terminal window, or save the key in the `.env` file. |
+
+Type `/help` once it's running. The rest of this page explains what it does.
+
+## What it is
+
 …that's the pitch. It is a lie of omission.
 
 It really is just an AI pair-programmer for the first few saves. It watches your project, and whenever you save a file it looks at the diff and quietly offers a hint, or stays silent if there's nothing worth interrupting for. Type a question and it answers.
@@ -190,29 +233,18 @@ It's told never to probe or work around its limits. If a limit blocks the task (
 
 ## Run it
 
-Requires Node.js 22 or newer and an Anthropic API key.
-
-Once it's published to npm, no clone is needed:
+[Quick start](#quick-start) covers installing from npm. To run from a git checkout instead:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-npx awakening-coder /path/to/your/project      # terminal
-npx -p awakening-coder awaken-web . --open     # web app
-```
-
-From a git checkout:
-
-```bash
+git clone https://github.com/AIEpisteme/awakening-coder.git
+cd awakening-coder
 npm install
 export ANTHROPIC_API_KEY=sk-ant-...      # or put it in a .env file next to package.json
-node src/cli.js /path/to/your/project    # or: npm link, then `awaken .`
+node src/cli.js /path/to/your/project    # terminal app
+node src/web.js /path/to/your/project --open   # web app
 ```
 
-On Windows, put paths with spaces in quotes:
-
-```powershell
-node src/cli.js "C:\Users\you\OneDrive - Company\Documents\my-project"
-```
+**Where it looks for the key:** your environment, then `~/.awakening-coder/.env`, then a `.env` next to its own `package.json` (the last one found wins). It never reads a `.env` from the project it is working on.
 
 If your API key isn't scoped to a workspace, you'll see *"This API key is not scoped to a workspace…"*. Tell it which workspace to use. Copy the workspace ID from the Claude Console, then do one of the following:
 

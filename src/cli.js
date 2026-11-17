@@ -26,6 +26,9 @@ const selfDir = path.dirname(fileURLToPath(import.meta.url));
 const selfRoot = path.join(selfDir, '..');
 // .env wins over inherited variables, so editing it always takes effect (see loadDotEnv).
 const shellFromEnvBefore = process.env.AWAKEN_SHELL;
+// It reads two .env files: ~/.awakening-coder/.env (the place for an npm install), then one next to
+// package.json (a git checkout), which wins. It never reads a .env from the project it works on.
+loadDotEnv(path.join(homeDir(), '.env'));
 const dotEnv = loadDotEnv(path.join(selfRoot, '.env'));
 if (dotEnv.overridden.length) console.error(c.dim(`  .env overrides ${dotEnv.overridden.join(', ')} from your system environment`));
 
@@ -111,7 +114,8 @@ In-session commands
 
 if (opt.help) { console.log(HELP); process.exit(0); }
 if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-  console.error(c.red('Set ANTHROPIC_API_KEY (environment or a .env file next to package.json).'));
+  console.error(c.red('No API key. Set ANTHROPIC_API_KEY in your environment, or put ANTHROPIC_API_KEY=sk-ant-... in ' + path.join(homeDir(), '.env')));
+  console.error(c.dim(process.platform === 'win32' ? '  PowerShell:  $env:ANTHROPIC_API_KEY = "sk-ant-..."' : '  export ANTHROPIC_API_KEY=sk-ant-...'));
   process.exit(1);
 }
 
