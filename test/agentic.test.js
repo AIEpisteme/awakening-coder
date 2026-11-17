@@ -190,3 +190,23 @@ test('the agent can never write inside .git (hooks and config run outside the sa
   await assert.rejects(run('write_file', { path: 'sub/../.git/config', content: '' }), /\.git/);
   assert.ok(!fs.existsSync(path.join(root, '.git', 'hooks', 'pre-commit')));
 });
+
+test('grep: a catastrophic pattern (e.g. from a prompt-injected file) is stopped, not left to freeze the app', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'redos-')));
+  fs.writeFileSync(path.join(root, 'a.txt'), 'a'.repeat(40) + '!\nfind me\n');
+  fs.writeFileSync(path.join(root, 'b.txt'), 'nothing here\n');
+  const run = makeToolRunner({ root, selfDir: root, term: { print() {}, question: async () => 'n' }, interactive: false });
+  const t = Date.now();
+  const out = await run('grep', { pattern: '^(a+)+$' });
+  assert.ok(Date.now() - t < 10_000, 'returned within the budget');
+  assert.match(out, /grep stopped after 3s: the pattern is too slow/);
+  const ok = await run('grep', { pattern: 'find me' });
+  assert.match(ok, /a\.txt:2: find me/);
+  assert.doesNotMatch(ok, /stopped/);
+});
+
+test('glob: an unclosed { is taken literally instead of building a broken pattern', () => {
+  assert.ok(globToRegExp('src/{a.js').test('src/{a.js'));
+  assert.ok(!globToRegExp('src/{a.js').test('src/a.js'));
+  assert.ok(globToRegExp('src/*.{js,ts}').test('src/x.ts'));
+});
