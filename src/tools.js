@@ -10,6 +10,8 @@ import { colorDiff, c } from './ui.js';
 import { isSecretPath, redactSecrets, containsSecret, REDACTED, scrubbedEnv, classifyCommand, dangerReason, isHighRiskWrite, executesCode } from './security.js';
 import { wrapShell } from './sandbox.js';
 import { runConfinedTests } from './confine.js';
+import { resolveApprovals, sandboxFacts } from './approvals.js';
+import { snapshotTree, diffTree, restoreFile, textOf } from './changes.js';
 
 export { isSecretPath, scrubbedEnv, classifyCommand };
 
@@ -131,12 +133,12 @@ export const TOOL_DEFS = [
   },
   {
     name: 'write_file',
-    description: 'Create a new file or fully replace one. The developer sees a diff and must approve. Prefer edit_file for existing files.',
+    description: 'Create a new file or fully replace one. The developer sees the diff and may need to approve it. Prefer edit_file for existing files.',
     input_schema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] },
   },
   {
     name: 'edit_file',
-    description: 'Replace one exact, unique occurrence of old_str with new_str in a file. The developer sees a diff and must approve.',
+    description: 'Replace one exact, unique occurrence of old_str with new_str in a file. The developer sees the diff and may need to approve it.',
     input_schema: {
       type: 'object',
       properties: { path: { type: 'string' }, old_str: { type: 'string' }, new_str: { type: 'string' } },
@@ -146,7 +148,7 @@ export const TOOL_DEFS = [
   {
     name: 'run_command',
     description:
-      'Run a shell command in the project root (tests, builds, linters, git status, scaffolding). Output is returned. Safe read-only commands and test runs are auto-approved; others need approval; destructive ones always need approval. Secrets are removed from the environment. No interactive commands.',
+      'Run a shell command in the project root (tests, builds, linters, git status, scaffolding). Output is returned. Depending on the sandbox and the developer\'s approvals setting, a command runs right away or waits for approval; destructive ones always wait. If a command changes a file that controls what runs later (package.json, hooks, CI or build config), the developer must approve that change or it is put back: use edit_file for those files instead. Secrets are removed from the environment. No interactive commands.',
     input_schema: {
       type: 'object',
       properties: { command: { type: 'string' }, timeout_seconds: { type: 'number', description: 'Default 120, max 600' } },
@@ -194,6 +196,15 @@ export const READ_SELF_DEF = {
  * autoWrites / autoCommands: set either one separately (they default to autoYes).
  *   Each may be a boolean or a function read at every prompt, so a live toggle (the web app's
  *   auto-approve checkbox) takes effect in the middle of a running task.
+ * approvals: 'careful' | 'smart' | 'auto' (or a function, read live). See approvals.js.
+ *   careful (the default here): every edit and every command that runs code asks.
+ *   smart: edits ask once per task ("approve all edits in this task"); commands run without asking when
+ *          the OS sandbox seals them (project-only writes, no network), or when the developer chose
+ *          "always allow" for that exact command in this project (allowList).
+ *   auto:  same as autoYes.
+ *   In every mode, destructive commands and high-risk files need a human. One runner serves one task:
+ *   the "all edits" grant ends with it.
+ * allowList: AllowList of commands the developer always allows here. journal: EditJournal for /undo.
  * interactive: false → nothing can be approved by a human, so anything needing approval is denied.
  * shell: { os, allowNet, allowUnsandboxed } — os is the probed OS sandbox (null = commands are NOT isolated).
  *   Without isolation, any command that executes code needs a human, and --yes doesn't cover it
@@ -201,15 +212,24 @@ export const READ_SELF_DEF = {
  */
 const live = (v) => Boolean(typeof v === 'function' ? v() : v);
 
-export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false, autoWrites = autoYes, autoCommands = autoYes, interactive = true, onWrite, signal, shell = {} }) {
+export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false, autoWrites = autoYes, autoCommands = autoYes, interactive = true, onWrite, signal, shell = {}, approvals = 'careful', allowList = null, journal = null }) {
+  const mode = () => resolveApprovals(typeof approvals === 'function' ? approvals() : approvals) ?? 'careful';
+  let editsGranted = false; // "approve all edits in this task"
+
   // kind: 'write' | 'command' (auto-approvable) or 'risky' | 'danger' (always a human).
-  async function approve(label, kind) {
-    if (!interactive) return false;
-    const ans = (await term.question(c.yellow(`${label} [y/N] `), { kind })).trim().toLowerCase();
-    return ans === 'y' || ans === 'yes';
+  // choices: 'y' and 'n', plus at most one wider grant: 'task' (all edits in this task) or 'always'
+  // (this exact command, in this project). Returns the choice taken; anything unclear is 'n'.
+  async function approve(label, kind, { choices = ['y', 'n'], why = '' } = {}) {
+    if (!interactive) return 'n';
+    const wider = choices.find((x) => x === 'task' || x === 'always');
+    const keys = wider === 'task' ? '[y]es / [a]ll edits in this task / [N]o' : wider === 'always' ? '[y]es / [a]lways allow it in this project / [N]o' : '[y/N]';
+    const raw = String(await term.question(c.yellow(`${label} ${keys} `), { kind, choices, why, label })).trim().toLowerCase();
+    if (raw === 'y' || raw === 'yes') return 'y';
+    if (wider && (raw === wider || raw === 'a' || raw === 'all' || raw === 'always')) return wider;
+    return 'n';
   }
 
-  async function writeApproved(rel, abs, before, after) {
+  async function writeApproved(rel, abs, before, after, existed = true) {
     // The model only ever sees redacted secrets; never let it write a placeholder over a real one.
     if (after.includes(REDACTED) && containsSecret(before)) {
       return 'Refused: this would replace a real secret in the file with a [REDACTED] placeholder. Use edit_file on the specific lines you need to change, leaving the secret untouched.';
@@ -218,18 +238,48 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
     const diff = redactSecrets(unifiedDiff(before, after)) || '(no change)';
     term.print(`${c.bold(`\n✎ ${before === '' ? 'create' : 'edit'} ${rel}`)}${risky ? c.red('  ⚠ this file controls what runs or what I obey later') : ''}\n${colorDiff(diff)}`);
     // High-risk files always need a human, even with --yes (and never apply non-interactively).
-    if ((risky || !live(autoWrites)) && !(await approve(risky ? c.red('Apply this high-risk change?') : 'Apply this change?', risky ? 'risky' : 'write'))) {
-      if (interactive) awareness?.note('editsDeclined');
-      return interactive
-        ? 'The developer declined this change. Ask what they would prefer, or try a different approach.'
-        : `Change not applied: running non-interactively${risky ? ' and this is a high-risk file that always needs a human' : ' without --yes'}.`;
-    }
+    const m = mode();
+    const byGrant = m === 'smart' && editsGranted;
+    if (risky || !(live(autoWrites) || m === 'auto' || byGrant)) {
+      const a = await approve(risky ? c.red('Apply this high-risk change?') : 'Apply this change?', risky ? 'risky' : 'write', {
+        choices: !risky && m === 'smart' ? ['y', 'task', 'n'] : ['y', 'n'],
+        why: risky ? 'This file controls what runs later, or what I obey, so it always asks.' : '',
+      });
+      if (a === 'n') {
+        if (interactive) awareness?.note('editsDeclined');
+        return interactive
+          ? 'The developer declined this change. Ask what they would prefer, or try a different approach.'
+          : `Change not applied: running non-interactively${risky ? ' and this is a high-risk file that always needs a human' : ' without --yes'}.`;
+      }
+      if (a === 'task') editsGranted = true;
+    } else if (byGrant && !live(autoWrites)) term.print(c.dim('  ✓ applied (you approved all edits in this task)'));
     await fs.mkdir(path.dirname(abs), { recursive: true });
     onWrite?.(rel, after); // so the watcher doesn't "suggest" on our own edit
     await fs.writeFile(abs, after);
+    journal?.record(rel, abs, existed ? before : null, after);
     awareness?.feed('accept', rel);
     awareness?.note('editsApproved');
     return `Wrote ${rel} (${after.split('\n').length} lines).`;
+  }
+
+  // After a command: say what it changed, and never let an unattended command leave behind a change to a
+  // file that controls what runs later. That change is shown and needs a human to keep it.
+  async function settle(before, attended) {
+    const { changed, risky } = diffTree(before, await snapshotTree(root));
+    if (changed.length) term.print(c.dim(`  changed on disk: ${changed.slice(0, 8).join(', ')}${changed.length > 8 ? ` (+${changed.length - 8} more)` : ''}`));
+    const notes = [];
+    for (const item of risky) {
+      if (attended) { term.print(c.yellow(`  ⚠ this command changed ${item.rel}, which controls what runs later`)); continue; }
+      const diff = redactSecrets(unifiedDiff(textOf(item.before), textOf(item.after))) || '(a change that can\'t be shown as text)';
+      term.print(`${c.bold(`\n✎ ${item.after ? (item.before ? 'changed' : 'created') : 'deleted'} by that command: ${item.rel}`)}${c.red('  ⚠ this file controls what runs or what I obey later')}\n${colorDiff(diff)}`);
+      const keep = await approve(c.red(`Keep this change to ${item.rel}?`), 'risky', { why: 'The command ran without asking, and this file controls what runs later. Decline to put the file back.' });
+      if (keep !== 'n') continue;
+      let how;
+      try { how = await restoreFile(root, item); if (item.before?.content) onWrite?.(item.rel, item.before.content.toString('utf8')); } catch (e) { how = `could NOT be put back: ${e.message}`; }
+      term.print((how.startsWith('could NOT') ? c.red : c.dim)(`  ${item.rel} ${how === 'removed' ? 'removed' : how === 'restored' ? 'put back' : how}`));
+      notes.push(`Your command changed ${item.rel}, a file that controls what runs later. ${interactive ? 'The developer did not approve that' : 'Nobody was there to approve that'}, so it was ${how === 'removed' ? 'removed' : how === 'restored' ? 'put back' : `flagged (${how})`}. To change this file, use edit_file or write_file: the developer is asked.`);
+    }
+    return notes;
   }
 
   return async function run(name, input = {}) {
@@ -272,8 +322,9 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
 
       case 'write_file': {
         const abs = resolveWritable(root, input.path);
+        const existed = fss.existsSync(abs);
         const before = await fs.readFile(abs, 'utf8').catch(() => '');
-        return writeApproved(input.path, abs, before, input.content);
+        return writeApproved(input.path, abs, before, input.content, existed);
       }
 
       case 'edit_file': {
@@ -291,25 +342,44 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
       case 'run_command': {
         const cmd = String(input.command || '').trim();
         if (!cmd) return 'Empty command.';
-        const isolated = Boolean(shell.os);
+        // The sandbox stands in for a human only when it also cuts the network (a Docker Sandbox applies Docker's own policy).
+        const { isolated, sealed } = sandboxFacts(shell);
         let kind = classifyCommand(cmd);
         // Unisolated, even "safe" test/build commands run project code on the real machine: a human decides.
         if (!isolated && kind === 'auto' && executesCode(cmd)) kind = 'ask';
-        const autoOk = live(autoCommands) && (isolated || live(shell.allowUnsandboxed));
+        const m = mode();
+        const remembered = kind === 'ask' && m !== 'careful' && Boolean(allowList?.has(root, cmd));
+        const autoOk = kind === 'ask' && (
+          ((live(autoCommands) || m === 'auto') && (isolated || live(shell.allowUnsandboxed))) ||
+          (m === 'smart' && sealed) ||
+          remembered);
         const why = dangerReason(cmd);
         const tag = isolated ? c.dim(' [sandboxed]') : c.yellow(' [NOT sandboxed]');
-        term.print(`${kind === 'danger' ? c.red(`\n⚠ (${why}) $ `) : c.bold('\n$ ')}${cmd}${tag}`);
-        const ok = kind === 'auto' || (kind === 'ask' && autoOk) || (await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : `Run this command${isolated ? '' : ' outside any sandbox'}?`, kind === 'danger' ? 'danger' : 'command'));
+        term.print(`${kind === 'danger' ? c.red(`\n⚠ (${why}) $ `) : c.bold('\n$ ')}${cmd}${tag}${remembered ? c.dim(' [always allowed here]') : ''}`);
+        let ok = kind === 'auto' || autoOk, attended = remembered;
+        if (!ok) {
+          const offerAlways = kind === 'ask' && m === 'smart' && Boolean(allowList);
+          const a = await approve(kind === 'danger' ? c.red(`This command ${why}. Run it?`) : `Run this command${isolated ? '' : ' outside any sandbox'}?`, kind === 'danger' ? 'danger' : 'command', {
+            choices: offerAlways ? ['y', 'always', 'n'] : ['y', 'n'],
+            why: kind === 'danger' ? `It ${why}, so it always asks.`
+              : !isolated ? 'Nothing sandboxes commands on this machine, so it would run with your own access.'
+              : !sealed ? 'The sandbox has network access (--net), so commands ask.' : '',
+          });
+          ok = a !== 'n'; attended = ok;
+          if (a === 'always' && allowList.add(root, cmd)) term.print(c.dim('  remembered: this exact command won\'t ask again in this project (/allowed lists them)'));
+        }
         if (!ok && interactive) awareness?.note('commandsDeclined');
         if (!ok) return interactive ? 'The developer declined to run this command.' : `Command not run: non-interactive mode cannot approve it (${isolated ? 'use --yes for ordinary commands' : 'no OS sandbox is available, so --yes does not cover commands that execute code'}; destructive ones are never auto-approved).`;
         const timeoutMs = Math.min(600, Math.max(1, Number(input.timeout_seconds) || 120)) * 1000;
         // Fail closed: if isolation was promised, the command runs isolated or not at all.
         const wrap = isolated ? wrapShell(cmd, { root, os: shell.os, allowNet: shell.allowNet }) : null;
+        const before = executesCode(cmd) ? await snapshotTree(root) : null; // read-only commands change nothing
         const { code, signal: sig, out } = await runShell(cmd, { cwd: root, timeoutMs, signal, wrap });
         awareness?.note(code === 0 ? 'commandsRun' : 'commandsFailed');
         const tail = redactSecrets(out).trim().split('\n').slice(-6).join('\n');
         term.print(c.dim(tail ? tail.replace(/^/gm, '  ') : '  (no output)') + (code === 0 ? '' : c.yellow(`\n  exit ${code ?? sig}`)));
-        return `exit code: ${code ?? `killed (${sig})`}\n${redactSecrets(out) || '(no output)'}`;
+        const notes = before ? await settle(before, attended) : [];
+        return `exit code: ${code ?? `killed (${sig})`}\n${redactSecrets(out) || '(no output)'}${notes.length ? `\n\n${notes.join('\n')}` : ''}`;
       }
 
       case 'run_tests': {

@@ -154,8 +154,9 @@ npm run web -- /path/to/project another/project     # or: node src/web.js <folde
 It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
 
 - **Chat** with an **Ask / Code** switch. Answers stream in as they're written. In Code mode it plans, edits and runs tests, the same as `/code`.
-- **Approval cards.** Every edit appears as a colored diff and every command is shown before it runs, each with **Approve** and **Decline** buttons.
-- **Auto-approve.** Tick the checkbox, or type `/auto on`, and edits and commands go ahead without asking. It takes effect immediately, including for a card that's already waiting. Where commands can't be OS-sandboxed (for example on Windows), ticking it also lets ordinary commands such as `npm test` run directly on your computer, and the app tells you so. Destructive commands and high-risk files (`package.json`, hooks, CI, `AWAKEN.md`) still ask.
+- **Approval cards that ask less.** A dropdown in the header sets how often it asks: **Ask every time**, **Smart** (the default) or **Auto**. See [Fewer, better approval prompts](#fewer-better-approval-prompts). Each card says why it is asking and offers scoped choices as buttons. After a task that edited files, an **Undo** button puts the edits back.
+- **Saved chats.** Each project's conversations are saved and listed under **Chats** in the left panel. After a restart, the last one is picked up where it left off. See [It remembers the conversation](#it-remembers-the-conversation).
+- **Proof log.** Bug cards have **Fix it** and **Not a bug** buttons, and `/proof` shows the tally. See [Proof log](#proof-log-what-it-found-on-its-own).
 - **Model and effort menu.** The button in the header (for example **Opus 5.5 · High ▾**) opens a dropdown with two submenus:
   - **Model:** Opus 5.5, Sonnet 5.5 or Haiku 5.5.
   - **Effort:** Low, Medium, High, Extra high or Max. The setting is sent to Claude as `output_config.effort`.
@@ -178,6 +179,58 @@ It prints a private link (`http://127.0.0.1:7357/?t=…`). Open it to get:
   - Scouting is read-only. It may run your tests only when commands are OS-sandboxed.
 
 It listens on `127.0.0.1` only. Every request needs the random token from the printed link and a matching Host and Origin, so other websites can't drive it, including through DNS rebinding. The page runs under a strict Content Security Policy, and it confines itself like the terminal version. `--shell cloud` runs Code mode in Claude's cloud sandbox.
+
+## Fewer, better approval prompts
+
+People who are asked about everything start approving without reading. So the coder asks less often, and each question matters more. Choose a mode with `--approvals <mode>`, `/approvals <mode>`, or the dropdown in the web app.
+
+| Mode | Edits | Commands |
+|---|---|---|
+| `careful` ("Ask every time") | Ask every time | Ask for every command that runs code |
+| `smart` (default) | Ask once per task; you can approve all edits in that task | Run without asking when the sandbox seals them (project-only writes, no open network). Otherwise ask, with a choice to always allow that exact command in this project |
+| `auto` (`--yes`, `/auto on`) | Go ahead | Go ahead when sandboxed, or when you chose to allow unsandboxed commands |
+
+- **Every diff is still shown,** in every mode. `/undo` puts back the edits from the last task.
+- **Always asks, in every mode:**
+  - destructive or outward commands (`rm -rf`, `git push`, `curl`, installs);
+  - edits to high-risk files (`package.json`, git hooks, CI, config, `AWAKEN.md`).
+
+  A dangerous command can never be added to the always-allow list.
+- **A check after unattended commands.** After any command that ran without your approval, the program checks the files that control what runs later. If one changed, it shows you the diff, and puts the file back unless you keep the change.
+- **Always-allowed commands.** `/allowed` lists them. `/allowed remove N` and `/allowed clear` remove them.
+- **Headless runs** (`-p`) stay `careful` unless you pass `--yes` or `--approvals`. Unprompted looks never ask and never edit.
+
+## Proof log: what it found on its own
+
+The coder keeps a record of every bug it reported unprompted, and what you did about each one. The program writes the record, not the model. An outcome changes only when you act:
+
+| You do | Recorded as |
+|---|---|
+| Nothing yet | no response yet |
+| Click **Fix it** (or `/fix`) | fix requested |
+| The fix run edits files | fixed |
+| Click **Not a bug** (or `/dismiss`) | dismissed |
+
+- **`/proof`** shows the numbers for this project and across all your projects.
+- **Publishing is opt-in, per project.**
+  - `/proof on` writes `PROOF.md` in the project and rewrites it after every report or outcome, so you can commit it.
+  - `/proof summary` publishes counts only, with no file names.
+  - `/proof off` stops updating it.
+- **It won't overwrite your file.** If the project already has a `PROOF.md` that you wrote, it is left alone.
+- **Secrets are redacted** before anything is stored.
+- **It learns from the tally.** When more reports are dismissed than fixed, it checks harder before reporting.
+
+## It remembers the conversation
+
+Conversations are saved per project, so a restart doesn't lose them.
+
+- **Web app:** the last conversation in a project is picked up when you open it, and all saved ones are listed under **Chats**. **New conversation** starts a fresh one, and the old one stays saved. The × deletes one.
+- **Terminal:** start with `-c` (`--continue`) to pick up the last conversation. `/chats` lists them, `/resume [N]` opens one, and `/clear` starts a new one.
+- **What is saved:** the same messages the model would be sent again, which is at most the last 30, with secrets redacted.
+- **Where:** in the coder's own folder, `~/.awakening-coder/sessions/`, as private files. Nothing is written into your project.
+- **Limits:** 20 conversations per project; the oldest are dropped. A damaged file is never loaded.
+- **Forgetting:** `/forget` or `--forget` erases the saved conversations along with its memory of you. Set `AWAKEN_RESUME=off` to stop the web app picking up the last one automatically.
+- **Cloud `/code` tasks** run in a separate cloud session and aren't part of the saved conversation.
 
 ## It shows what it costs, and stops at your cap
 
@@ -365,6 +418,10 @@ src/proactive.js  unprompted bug watch, feature and new-program ideas (Lucid+), 
 src/tar.js        dependency-free tar for shipping the project and reading back changes
 src/sandbox.js    environment detection, self-relaunch under the permission model, OS sandbox for commands
 src/docker-sandbox.js  Docker Sandboxes (sbx) microVM for commands when there's no OS sandbox
+src/cost.js       cost meter, list prices, spend cap
+src/approvals.js  approval modes, always-allow list, check of high-risk files after unattended commands
+src/prooflog.js   record of unprompted bug reports and their outcomes; optional PROOF.md
+src/sessions.js   saved conversations per project
 src/confine.js    confined test runs (Node permission model) with the must-fail canary
 src/evolve.js     sandbox (confinement-safe copy + dependency shims), guardian, protected files, staged apply, backup, rollback
 src/diff.js       dependency-free line diff

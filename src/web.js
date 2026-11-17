@@ -20,6 +20,10 @@ import { unifiedDiff, changedLineCount } from './diff.js';
 import { Proactive } from './proactive.js';
 import { CostMeter, formatUsd } from './cost.js';
 import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
+import { APPROVAL_MODES, DEFAULT_APPROVALS, resolveApprovals, approvalsLabel, describeApprovals, sandboxFacts, AllowList } from './approvals.js';
+import { EditJournal } from './changes.js';
+import { ProofLog } from './prooflog.js';
+import { SessionStore, displayOf } from './sessions.js';
 
 const MAX_BODY = 1_000_000;
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -60,9 +64,12 @@ export function createWebApp({
   // Live features (like the terminal): watch(root, onChange) → { close, noteSelfWrite }; scout(mode, msg, root) → text.
   watch = null, scout = null, hintCooldownMs = 15_000, proactiveConfig = {},
   // Model and effort, switchable from the menu (shared with main(), so scouts and the cloud shell follow it).
+  // settings.approvals: how often it asks ('careful' | 'smart' | 'auto'); see approvals.js.
   settings = { model: MODELS[0].id, effort: DEFAULT_EFFORT },
   // Running cost of this session and the optional spend cap (shared with main(), so every agent records into it).
   meter = new CostMeter(),
+  // Session memory: each project's conversations are saved, and the latest one is picked up again after a restart.
+  resume = true,
 }) {
   // Remember the last choice across restarts (unless main() was given one on the command line).
   const settingsFile = stateDir ? path.join(stateDir, 'web-settings.json') : null;
@@ -73,9 +80,23 @@ export function createWebApp({
       if (resolveEffort(saved.effort)) settings.effort = resolveEffort(saved.effort);
     } catch { /* first run */ }
   }
+  // How often it asks is remembered too (a flag wins). "Auto" is never restored from a file: you turn it on each session.
+  if (!resolveApprovals(settings.approvals)) {
+    let saved = null;
+    try { saved = resolveApprovals(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).approvals); } catch { /* first run */ }
+    settings.approvals = saved && saved !== 'auto' ? saved : DEFAULT_APPROVALS;
+  }
+  const allowList = new AllowList(stateDir ? path.join(stateDir, 'allowed-commands.json') : null);
+  // What it reported on its own and what you did about it (see prooflog.js). Published only where you turn that on.
+  const proof = new ProofLog(stateDir ? path.join(stateDir, 'proof-log.json') : null);
+  const publishProof = (p, { quiet = false } = {}) => {
+    const r = proof.publish(p.root, { onWrite: (rel, content) => { if (p === current) watcher?.noteSelfWrite?.(rel, content); } });
+    if (!quiet && !r.written && r.reason && !['off', 'unchanged'].includes(r.reason)) emit({ type: 'status', text: `Proof log not published: ${r.reason}` });
+    return r;
+  };
   // The spend cap is remembered too (a --budget flag or AWAKEN_BUDGET, already set on the meter, wins).
   if (settingsFile && meter.budget === null) { try { meter.setBudget(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).budget ?? null); } catch { /* first run */ } }
-  const saveSettings = () => { try { if (settingsFile) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify({ model: settings.model, effort: settings.effort, budget: meter.budget })); } } catch { /* best effort */ } };
+  const saveSettings = () => { try { if (settingsFile) { fs.mkdirSync(stateDir, { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify({ model: settings.model, effort: settings.effort, budget: meter.budget, approvals: settings.approvals })); } } catch { /* best effort */ } };
   const projects = new Map(); // id -> { id, name, root, kind }
   const addProject = (root, name, kind = 'local') => {
     const id = Buffer.from(root).toString('base64url').slice(-24);
@@ -88,7 +109,8 @@ export function createWebApp({
   const clients = new Set();
   const questions = new Map();
   let job = null; // { abort, kind }
-  let autoYes = false;
+  const isAuto = () => settings.approvals === 'auto';
+  const approvalsNote = (mode = settings.approvals) => describeApprovals(mode, { ...sandboxFacts(shell), unsandboxedOk: true });
 
   let costTimer = null, warned = false;
   meter.onChange = () => {
@@ -100,35 +122,65 @@ export function createWebApp({
   const emit = (ev) => { const line = `data: ${JSON.stringify(ev)}\n\n`; for (const res of clients) res.write(line); };
   const webTerm = {
     print: (s) => emit({ type: 'print', text: strip(s) }),
-    question: (q, { kind = 'other' } = {}) => new Promise((resolve) => {
+    // choices: 'y'/'n', plus 'task' (all edits in this task) or 'always' (this command, this project). why: one line.
+    question: (q, { kind = 'other', choices = ['y', 'n'], why = '', label } = {}) => new Promise((resolve) => {
       const id = randomBytes(8).toString('hex');
-      questions.set(id, { resolve, kind });
-      emit({ type: 'question', id, prompt: strip(q), kind });
+      const ev = { type: 'question', id, prompt: strip(label ?? q), kind, choices, why };
+      questions.set(id, { resolve, kind, ev });
+      emit(ev);
     }),
   };
-  const answer = (id, a, by) => { const q = questions.get(id); if (!q) return false; questions.delete(id); q.resolve(a); emit({ type: 'answered', id, by }); return true; };
+  const answer = (id, a, by) => { const q = questions.get(id); if (!q) return false; questions.delete(id); q.resolve(a); emit({ type: 'answered', id, by, answer: a }); return true; };
   const answerAll = (a) => { for (const id of [...questions.keys()]) answer(id, a); };
   // Ordinary edits and commands may be auto-approved; destructive commands and high-risk files never are.
   const AUTO_KINDS = new Set(['write', 'command']);
-  // Auto-approve is read live, so switching it on mid-task applies to the next prompt, and to the
-  // ones already waiting. With it on, ordinary commands run even where no OS sandbox exists
-  // (e.g. Windows): ticking the box is that explicit choice. The UI says so when you tick it.
-  const toolShell = { ...shell, allowUnsandboxed: () => autoYes || Boolean(typeof shell.allowUnsandboxed === 'function' ? shell.allowUnsandboxed() : shell.allowUnsandboxed) };
+  // The approval mode is read live, so switching to Auto mid-task applies to the next prompt, and to the
+  // ones already waiting. In Auto, ordinary commands run even where no OS sandbox exists (e.g. Windows):
+  // choosing it is that explicit choice. The UI says so when you choose it.
+  const toolShell = { ...shell, allowUnsandboxed: () => isAuto() || Boolean(typeof shell.allowUnsandboxed === 'function' ? shell.allowUnsandboxed() : shell.allowUnsandboxed) };
 
+  const chats = new SessionStore(stateDir ? path.join(stateDir, 'sessions') : null);
   const agentFor = (p) => {
-    const a = (p.agent ??= makeAgent(p.root));
+    if (!p.agent) {
+      p.agent = makeAgent(p.root);
+      // Pick up this project's most recent conversation where it left off.
+      const latest = resume ? chats.list(p.root)[0] : null;
+      const saved = latest ? chats.load(p.root, latest.id) : null;
+      if (saved) { p.agent.history = saved.history; p.chat = { id: saved.id, createdAt: saved.createdAt }; p.resumed = saved.updatedAt; }
+    }
+    const a = p.agent;
     a.model = settings.model; a.effort = settings.effort; // the menu's current choice, every time
     return a;
   };
+  const saveChat = (p) => {
+    const h = p.agent?.history;
+    if (!Array.isArray(h) || !h.length) return;
+    const meta = chats.save(p.root, { id: p.chat?.id, createdAt: p.chat?.createdAt, model: settings.model, history: h });
+    if (meta) p.chat = { id: meta.id, createdAt: meta.createdAt };
+  };
+  const openChat = (p, saved) => { agentFor(p).history = saved ? saved.history : []; p.chat = saved ? { id: saved.id, createdAt: saved.createdAt } : null; p.resumed = null; };
+  // What the page shows for a project: its saved chats, and the conversation the coder currently remembers.
+  const chatView = (p) => {
+    if (!p) return { current: null, resumed: null, chats: [], messages: [] };
+    const a = agentFor(p);
+    return { current: p.chat?.id ?? null, resumed: p.resumed ?? null, chats: chats.list(p.root), messages: displayOf(Array.isArray(a.history) ? a.history : []) };
+  };
 
   // ---------- live: save-hints and unprompted reports (same logic as the terminal) ----------
-  let hints = true, watcher = null, lastHintAt = 0, hintTimer = null, queued = null, lastFinding = null;
+  let hints = true, watcher = null, lastHintAt = 0, hintTimer = null, queued = null;
+  let lastFinding = null; // { id, text, project } — the newest unprompted bug report
+  let scouting = null; // the project the scout is looking at (you may switch projects before it reports)
   const isFree = () => !job && questions.size === 0;
   const proactive = scout && awareness ? new Proactive({
     awareness, isFree, isQuiet: () => false, config: proactiveConfig,
     listCode: () => (current ? listFiles(current.root, '.', 500) : Promise.resolve([])),
-    show: (kind, text) => { if (kind === 'bugs') lastFinding = text; emit({ type: 'proactive', kind, text }); },
-    scout: (mode, msg) => (current ? scout(mode, msg, current.root) : Promise.resolve('')),
+    show: (kind, text) => {
+      const p = scouting ?? current;
+      let id;
+      if (kind === 'bugs' && p) { id = proof.add({ root: p.root, project: p.name, text }).id; lastFinding = { id, text, project: p }; publishProof(p); }
+      emit({ type: 'proactive', kind, text, id });
+    },
+    scout: (mode, msg) => { scouting = current; return current ? scout(mode, msg, current.root) : Promise.resolve(''); },
   }) : null;
 
   async function hint(change) {
@@ -172,16 +224,20 @@ export function createWebApp({
     return {
       projects: [...projects.values()].map(({ id, name, root, kind }) => ({ id, name, root, kind })),
       current: current?.id ?? null,
-      busy: Boolean(job), autoYes, hints,
+      busy: Boolean(job), autoYes: isAuto(), hints,
+      approvals: settings.approvals, approvalModes: APPROVAL_MODES.map(({ id, label, note }) => ({ id, label, note })),
+      approvalsNote: approvalsNote(),
+      allowed: current ? allowList.list(current.root) : [], canUndo: Boolean(current?.journal?.entries.length),
       model: settings.model, effort: settings.effort, cost: meter.toJSON(),
       models: MODELS.map(({ id, label, note }) => ({ id, label, note })), efforts: EFFORTS.map(({ id, label, note }) => ({ id, label, note })), osSandbox: Boolean(shell.os),
       proactive: proactive ? { available: true, enabled: proactive.enabled, awake: proactive.awake, status: proactive.status() } : { available: false },
-      lastFinding: Boolean(lastFinding),
+      lastFinding: Boolean(lastFinding), proofPublishing: current ? proof.publishing(current.root) : null,
       stage: awareness?.describe?.() ?? '', sandbox: sandboxReport, info: describe(),
     };
   }
 
-  async function startMessage(text, mode) {
+  // after({ ok, edited }): called once the task has finished, whatever happened.
+  async function startMessage(text, mode, after) {
     if (!current) throw Object.assign(new Error('Pick a project first.'), { status: 400 });
     if (job) throw Object.assign(new Error('Busy with the last request; stop it or wait.'), { status: 409 });
     const p = current, ac = new AbortController();
@@ -189,15 +245,22 @@ export function createWebApp({
     emit({ type: 'start', mode });
     if (awareness) for (const l of awareness.feed(mode === 'code' ? 'code' : 'ask')) emit({ type: 'announce', text: l });
     p.agent?.cancelSuggestion?.();
-    const runTool = makeToolRunner({ root: p.root, selfDir, awareness, term: webTerm, autoYes: () => autoYes, shell: toolShell, signal: ac.signal, onWrite: (rel, content) => watcher?.noteSelfWrite?.(rel, content) });
+    // One runner per task: "approve all edits in this task" ends with it. The journal lets /undo put the edits back.
+    const journal = new EditJournal();
+    let ok = false;
+    const runTool = makeToolRunner({ root: p.root, selfDir, awareness, term: webTerm, approvals: () => settings.approvals, allowList, journal, shell: toolShell, signal: ac.signal, onWrite: (rel, content) => watcher?.noteSelfWrite?.(rel, content) });
     try {
       if (mode === 'code' && runCode) await runCode(text, { root: p.root, runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }), onStatus: (s) => emit({ type: 'status', text: strip(s) }) });
       else await agentFor(p).converse(text, { mode: mode === 'code' ? 'code' : 'ask', runTool, signal: ac.signal, onText: (t) => emit({ type: 'text', text: strip(t) }) });
-      emit({ type: 'done' });
+      ok = true;
+      emit({ type: 'done', edited: journal.files });
     } catch (e) {
-      emit({ type: 'error', text: ac.signal.aborted ? 'Stopped.' : strip(e.message) });
+      emit({ type: 'error', text: ac.signal.aborted ? 'Stopped.' : strip(e.message), edited: journal.files });
     } finally {
       answerAll('n');
+      if (journal.entries.length) p.journal = journal; // the last task that edited something is the one /undo reverts
+      try { after?.({ ok, edited: journal.files }); } catch { /* bookkeeping must not break the session */ }
+      saveChat(p); // session memory: the conversation survives a restart
       job = null;
       emit({ type: 'state', state: stateJson() });
     }
@@ -292,7 +355,7 @@ export function createWebApp({
       if (req.method === 'GET' && url.pathname === '/events') {
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
         res.write(`data: ${JSON.stringify({ type: 'state', state: stateJson() })}\n\n`);
-        for (const [id] of questions) res.write(`data: ${JSON.stringify({ type: 'question', id, prompt: 'A question is waiting (asked before you connected): answer it to continue.' })}\n\n`);
+        for (const q of questions.values()) res.write(`data: ${JSON.stringify(q.ev)}\n\n`); // asked before this page connected
         clients.add(res);
         const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
         req.on('close', () => { clearInterval(ping); clients.delete(res); });
@@ -310,6 +373,7 @@ export function createWebApp({
         if (st.size > 400_000) return json(res, 200, { path: url.searchParams.get('path'), content: `(${st.size} bytes — too large to show)` });
         return json(res, 200, { path: url.searchParams.get('path'), content: redactSecrets(fs.readFileSync(abs, 'utf8')) });
       }
+      if (req.method === 'GET' && url.pathname === '/api/chats') return json(res, 200, chatView(current));
       if (req.method === 'GET' && url.pathname === '/api/git') return json(res, 200, current ? await gitInfo(current) : { isRepo: false });
 
       if (req.method !== 'POST') return json(res, 404, { error: 'Not found' });
@@ -335,12 +399,37 @@ export function createWebApp({
           return json(res, 202, { started: true });
         }
         case '/api/answer': {
-          const a = body.answer === 'y' ? 'y' : body.answer === 'unconfined' || body.answer === 'evolve' ? body.answer : 'n';
+          const a = ['y', 'task', 'always', 'unconfined', 'evolve'].includes(body.answer) ? body.answer : 'n';
           if (!answer(body.id, a)) return json(res, 404, { error: 'No such question' });
           return json(res, 200, { ok: true });
         }
         case '/api/stop': job?.abort(); answerAll('n'); return json(res, 200, { ok: true });
-        case '/api/auto': autoYes = Boolean(body.on); if (autoYes) for (const [id, q] of [...questions]) if (AUTO_KINDS.has(q.kind)) answer(id, 'y', 'auto'); emit({ type: 'state', state: stateJson() }); return json(res, 200, stateJson());
+        case '/api/auto': // the old on/off switch: Auto, or back to the default
+        case '/api/approvals': {
+          const mode = url.pathname === '/api/auto' ? (body.on ? 'auto' : DEFAULT_APPROVALS) : resolveApprovals(body.mode);
+          if (!mode) return json(res, 400, { error: `Unknown setting. Choose ${APPROVAL_MODES.map((m) => m.label).join(', ')}.` });
+          settings.approvals = mode; saveSettings();
+          if (isAuto()) for (const [id, q] of [...questions]) if (AUTO_KINDS.has(q.kind)) answer(id, 'y', 'auto');
+          emit({ type: 'state', state: stateJson() });
+          return json(res, 200, { ...stateJson(), changed: `Approvals: ${approvalsLabel(mode)}. ${approvalsNote(mode)}` });
+        }
+        case '/api/allowed': {
+          // The commands you chose to always allow in this project. { remove: <number or text> } or { clear: true }.
+          if (!current) return json(res, 400, { error: 'No project' });
+          if (body.clear) allowList.remove(current.root);
+          else if (body.remove !== undefined) allowList.remove(current.root, String(body.remove));
+          emit({ type: 'state', state: stateJson() });
+          return json(res, 200, stateJson());
+        }
+        case '/api/undo': {
+          if (job) return json(res, 409, { error: 'Busy; wait or stop first.' });
+          const j = current?.journal;
+          if (!j?.entries.length) return json(res, 400, { error: 'Nothing to undo: the last task made no edits with its file tools.' });
+          const r = await j.undo({ onWrite: (rel, content) => watcher?.noteSelfWrite?.(rel, content) });
+          current.journal = null;
+          emit({ type: 'state', state: stateJson() });
+          return json(res, 200, { ...r, state: stateJson() });
+        }
         case '/api/model': {
           // Takes effect from the next message (a running task keeps the model it started with).
           const model = body.model === undefined ? settings.model : resolveModel(body.model);
@@ -383,13 +472,58 @@ export function createWebApp({
           return json(res, 200, stateJson());
         }
         case '/api/fix': {
-          if (!lastFinding) return json(res, 400, { error: 'No unprompted bug report to fix yet.' });
+          // Fix an unprompted bug report: the newest one, or the one whose card was clicked ({ id }).
+          const rep = body.id ? proof.get(String(body.id)) : null;
+          const finding = rep ? { id: rep.id, text: rep.text, project: [...projects.values()].find((p) => path.resolve(p.root) === rep.root) } : lastFinding;
+          if (!finding?.text) return json(res, 400, { error: 'No unprompted bug report to fix yet.' });
           if (job) return json(res, 409, { error: 'Busy with the last request; stop it or wait.' });
+          if (finding.project && finding.project !== current) return json(res, 400, { error: `That report is about ${finding.project.name}. Switch to that project first.` });
           awareness?.note('proactiveFixed');
-          void startMessage(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${lastFinding}`, 'code');
+          const target = current;
+          if (proof.mark(finding.id, 'accepted')) publishProof(target);
+          void startMessage(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${finding.text}`, 'code',
+            ({ ok, edited }) => { if (ok && edited.length && proof.mark(finding.id, 'fixed')) publishProof(target); });
           return json(res, 202, { started: true });
         }
-        case '/api/clear': if (current?.agent) current.agent.history = []; return json(res, 200, { ok: true });
+        case '/api/proof': {
+          // {}: the numbers. { action: 'dismiss', id? }: not a bug. { action: 'publish', mode: 'detail' | 'summary' | 'off' }: PROOF.md in this project.
+          if (!current) return json(res, 400, { error: 'No project' });
+          if (body.action === 'dismiss') {
+            const id = body.id ? String(body.id) : lastFinding?.id;
+            const rep = id ? proof.get(id) : null;
+            if (!rep) return json(res, 400, { error: 'No unprompted bug report to dismiss.' });
+            if (proof.mark(rep.id, 'dismissed')) { awareness?.note('proactiveDismissed'); const p = [...projects.values()].find((x) => path.resolve(x.root) === rep.root); if (p) publishProof(p); }
+          } else if (body.action === 'publish') {
+            const mode = body.mode === 'off' ? null : body.mode === 'summary' ? 'summary' : body.mode === 'detail' || body.mode === 'on' ? 'detail' : undefined;
+            if (mode === undefined) return json(res, 400, { error: 'Use detail, summary or off.' });
+            proof.setPublishing(current.root, mode);
+            if (mode) {
+              const r = publishProof(current, { quiet: true });
+              if (!r.written && r.reason !== 'unchanged') { proof.setPublishing(current.root, null); return json(res, 400, { error: r.reason }); }
+            }
+            emit({ type: 'state', state: stateJson() });
+          } else if (body.action) return json(res, 400, { error: 'Unknown action' });
+          return json(res, 200, { summary: proof.summary(current.root), stats: proof.stats(current.root), all: proof.stats(), publishing: proof.publishing(current.root), markdown: proof.markdown(current.root, proof.publishing(current.root) ?? 'detail') });
+        }
+        case '/api/clear': // a new conversation; the old one stays saved
+          if (job) return json(res, 409, { error: 'Busy; wait or stop first.' });
+          if (current) openChat(current, null);
+          return json(res, 200, { ok: true, ...chatView(current) });
+        case '/api/chat': {
+          // { id }: open a saved conversation. { remove: id }: delete one.
+          if (!current) return json(res, 400, { error: 'No project' });
+          if (job) return json(res, 409, { error: 'Busy; wait or stop first.' });
+          if (body.remove !== undefined) {
+            agentFor(current); // load what it currently remembers first, so deleting that chat starts a fresh one
+            if (!chats.remove(current.root, String(body.remove))) return json(res, 404, { error: 'No such chat.' });
+            if (current.chat?.id === String(body.remove)) openChat(current, null);
+            return json(res, 200, chatView(current));
+          }
+          const saved = chats.load(current.root, String(body.id ?? ''));
+          if (!saved) return json(res, 404, { error: 'That chat can\'t be opened: it is missing or damaged.' });
+          openChat(current, saved);
+          return json(res, 200, chatView(current));
+        }
         case '/api/commit': if (!current) return json(res, 400, { error: 'No project' }); return json(res, 200, await commit(current, body.message));
         case '/api/push': if (!current) return json(res, 400, { error: 'No project' }); return json(res, 200, await push(current));
         default: return json(res, 404, { error: 'Not found' });
@@ -401,7 +535,7 @@ export function createWebApp({
 
   server.on('listening', () => { void watchCurrent(); });
   server.on('close', () => { try { watcher?.close(); } catch { /* closed */ } proactive?.stop(); clearTimeout(hintTimer); });
-  return { server, token, projects, emit, state: stateJson, proactive, get autoYes() { return autoYes; } };
+  return { server, token, projects, emit, state: stateJson, proactive, allowList, proof, chats, get autoYes() { return isAuto(); } };
 }
 
 // ======================================================================
@@ -427,6 +561,7 @@ async function main() {
       model: { type: 'string' },
       effort: { type: 'string' },
       budget: { type: 'string' },
+      approvals: { type: 'string' },
       'fast-model': { type: 'string', default: process.env.AWAKEN_FAST_MODEL || 'claude-sonnet-5-5' },
       shell: { type: 'string', default: process.env.AWAKEN_SHELL || 'local' },
       net: { type: 'boolean', default: false },
@@ -436,7 +571,7 @@ async function main() {
     },
   });
   if (opt.help) {
-    console.log(`awaken-web [project-folder ...] [--port 7357] [--open] [--shell local|cloud] [--net] [--no-sandbox]
+    console.log(`awaken-web [project-folder ...] [--port 7357] [--open] [--shell local|cloud] [--net] [--no-sandbox] [--approvals careful|smart|auto]
   Opens a browser UI to talk to awakening-coder and let it code on these folders, or on a GitHub repo
   you paste in the UI (cloned into ${path.join(homeDir(), 'repos')}). Listens on 127.0.0.1 only.`);
     process.exit(0);
@@ -460,7 +595,9 @@ async function main() {
   const client = makeClient({ workspaceId: opt.workspace ?? process.env.ANTHROPIC_WORKSPACE_ID });
   // --model / --effort (or AWAKEN_MODEL / AWAKEN_EFFORT) win over the last choice saved from the menu.
   const flagModel = opt.model ?? process.env.AWAKEN_MODEL, flagEffort = opt.effort ?? process.env.AWAKEN_EFFORT;
-  const settings = { model: resolveModel(flagModel) ?? MODELS[0].id, effort: resolveEffort(flagEffort) ?? DEFAULT_EFFORT, fromFlags: Boolean(flagModel || flagEffort) };
+  const flagApprovals = opt.approvals ?? process.env.AWAKEN_APPROVALS;
+  if (flagApprovals && !resolveApprovals(flagApprovals)) { console.error(c.red(`Unknown --approvals "${flagApprovals}". Use careful, smart or auto.`)); process.exit(2); }
+  const settings = { model: resolveModel(flagModel) ?? MODELS[0].id, effort: resolveEffort(flagEffort) ?? DEFAULT_EFFORT, fromFlags: Boolean(flagModel || flagEffort), approvals: resolveApprovals(flagApprovals) ?? undefined };
   if (flagModel && !resolveModel(flagModel)) { console.error(c.red(`Unknown model "${flagModel}". Use opus, sonnet, haiku or a full claude-… id.`)); process.exit(2); }
   if (flagEffort && !resolveEffort(flagEffort)) { console.error(c.red(`Unknown effort "${flagEffort}". Use low, medium, high, xhigh or max.`)); process.exit(2); }
   const flagBudget = opt.budget ?? process.env.AWAKEN_BUDGET;
@@ -496,6 +633,7 @@ async function main() {
     watch: (root, onChange) => startWatcher(root, onChange), scout, proactiveConfig,
     hintCooldownMs: (num(process.env.AWAKEN_HINT_COOLDOWN_S) ?? 15) * 1000,
     projects: roots, stateDir, selfDir, awareness, makeAgent, runCode, shell, sandboxReport, settings, meter,
+    resume: !/^(off|0|false|no)$/i.test(process.env.AWAKEN_RESUME ?? ''),
     uiHtml: fs.readFileSync(path.join(selfDir, 'web-ui.html'), 'utf8'),
     describe: () => `model ${modelLabel(settings.model)} · ${effortLabel(settings.effort)} effort · hints on ${opt['fast-model']} · /code runs ${opt.shell === 'cloud' ? "in Claude's cloud sandbox" : 'here'}`,
   });

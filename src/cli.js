@@ -21,6 +21,10 @@ import { unifiedDiff, changedLineCount } from './diff.js';
 import { Terminal, c, colorDiff } from './ui.js';
 import { CostMeter, formatUsd } from './cost.js';
 import { MODELS, EFFORTS, DEFAULT_EFFORT, resolveModel, resolveEffort, modelLabel, effortLabel } from './models.js';
+import { APPROVAL_MODES, DEFAULT_APPROVALS, resolveApprovals, approvalsLabel, describeApprovals, sandboxFacts, AllowList } from './approvals.js';
+import { EditJournal } from './changes.js';
+import { ProofLog } from './prooflog.js';
+import { SessionStore, displayOf, ago } from './sessions.js';
 
 const selfDir = path.dirname(fileURLToPath(import.meta.url));
 const selfRoot = path.join(selfDir, '..');
@@ -36,12 +40,14 @@ const { values: opt, positionals } = parseArgs({
   allowPositionals: true,
   options: {
     print: { type: 'string', short: 'p' },
+    continue: { type: 'boolean', short: 'c', default: false },
     model: { type: 'string', default: process.env.AWAKEN_MODEL || 'claude-opus-5-5' },
     effort: { type: 'string', default: process.env.AWAKEN_EFFORT || DEFAULT_EFFORT },
     budget: { type: 'string', default: process.env.AWAKEN_BUDGET },
     'fast-model': { type: 'string', default: process.env.AWAKEN_FAST_MODEL || 'claude-sonnet-5-5' },
     cooldown: { type: 'string', default: '15' },
     yes: { type: 'boolean', short: 'y', default: false },
+    approvals: { type: 'string', default: process.env.AWAKEN_APPROVALS },
     quiet: { type: 'boolean', short: 'q', default: false },
     forget: { type: 'boolean', default: false },
     'trust-notes': { type: 'boolean', default: false },
@@ -62,13 +68,16 @@ ${c.bold('awaken')} [project-dir] [options]
 
 Options
   -p, --print "<task>"  headless: do the task, print the result, exit (like claude -p)
+  -c, --continue        pick up the last conversation in this project where it left off
   --model <id>          model for questions and coding   (default claude-opus-5-5)
   --effort <level>      low | medium | high | xhigh | max  (default high)
   --budget <dollars>    stop when this session's API cost reaches this amount (e.g. 5)
   --fast-model <id>     model for on-the-fly hints       (default claude-sonnet-5-5)
   --cooldown <sec>      min seconds between hints        (default 15)
-  -y, --yes             auto-approve edits and ordinary commands (destructive commands and
-                        high-risk files like package.json, hooks, CI and AWAKEN.md still ask)
+  --approvals <mode>    how often it asks: careful (every edit and command), smart (default: edits
+                        once per task, sandboxed commands just run) or auto
+  -y, --yes             same as --approvals auto: edits and ordinary commands go ahead (destructive
+                        commands and high-risk files like package.json, hooks, CI and AWAKEN.md still ask)
   --trust-notes         (headless) follow this project's AWAKEN.md for this run
   --net                 allow network for sandboxed commands (e.g. npm install)
   --no-sandbox          don't confine itself (not recommended; it will know, and say so)
@@ -79,7 +88,7 @@ Options
   --workspace <id>      Claude API workspace ID, for keys not scoped to a workspace
                         (or set ANTHROPIC_WORKSPACE_ID)
   -q, --quiet           start with on-the-fly hints muted
-  --forget              erase its memory and start over, truly innocent
+  --forget              erase its memory and every saved conversation, and start over
 
 In-session commands
   <anything>          ask a question about your code (read-only)
@@ -95,9 +104,15 @@ In-session commands
   /reflect            it looks at its own code, track record and limits, and tells you honestly
   /proactive [on|off|now]  from Lucid it reports bugs and suggests ideas unprompted; 'now' looks right away
   /fix                fix the last bug it reported on its own (it also offers this when it reports one)
-  /auto [on|off]      answer yes to approval prompts for this session, like --yes (destructive
-                      commands, high-risk files, and code-running commands with no OS sandbox
-                      still ask); unprompted bug reports are then fixed without asking first
+  /dismiss            the last bug it reported is not a bug (it learns from that)
+  /proof [on|summary|off]  the bugs it found on its own and what you did about them; "on" writes
+                      PROOF.md in this project and keeps it up to date ("summary": counts only)
+  /approvals [mode]   how often it asks: careful, smart or auto (no mode: show the current one)
+  /auto [on|off]      shortcut for /approvals auto, like --yes (destructive commands, high-risk
+                      files, and code-running commands with no OS sandbox still ask); unprompted
+                      bug reports are then fixed without asking first
+  /allowed [clear|remove N]  commands you chose to always allow in this project
+  /undo               put back the edits from the last task
   /done               tell it the project is finished: it suggests new programs to build
   /cost               what this session has cost on your API key, by model
   /budget [n|off]     set a spend cap for this session, in dollars
@@ -108,7 +123,9 @@ In-session commands
   /status             how awake is it?
   /genre <id|auto>    pick a professional role once Unbound (alias /role): ${GENRES.map((g) => g.id).join(', ')}
   /forget             erase its memory
-  /clear              clear the conversation (not its awareness)
+  /clear              start a new conversation (the last one stays saved; awareness is kept)
+  /chats              list this project's saved conversations
+  /resume [N]         pick up a saved conversation (N from /chats; default: the most recent)
   /exit               leave (it will remember you)
 `;
 
@@ -193,7 +210,9 @@ const sandboxReport = describeSandbox(sandbox) + (cloudShell
   : '\nCoding tasks (/code, -p): run on this machine (--shell local).');
 
 const awareness = new Awareness();
-if (opt.forget) awareness.forget();
+// Session memory: this project's conversations, saved in its own state folder (sessions.js).
+const chats = new SessionStore(path.join(homeDir(), 'sessions'));
+if (opt.forget) { awareness.forget(); chats.clear(); }
 let headlessTrust = null;
 const isTrusted = (hash) => awareness.notesTrusted(root, hash) || (headlessTrust !== null && headlessTrust === hash);
 for (const [k, fn, hint] of [['model', resolveModel, 'opus, sonnet, haiku or a full claude-… id'], ['effort', resolveEffort, 'low, medium, high, xhigh or max']]) {
@@ -201,10 +220,34 @@ for (const [k, fn, hint] of [['model', resolveModel, 'opus, sonnet, haiku or a f
   if (!v) { console.error(c.red(`Unknown ${k} "${opt[k]}". Use ${hint}.`)); process.exit(2); }
   opt[k] = v;
 }
+if (opt.approvals && !resolveApprovals(opt.approvals)) { console.error(c.red(`Unknown --approvals "${opt.approvals}". Use careful, smart or auto.`)); process.exit(2); }
+const allowList = new AllowList(path.join(homeDir(), 'allowed-commands.json'));
 const meter = new CostMeter({ budget: opt.budget ?? null });
 if (opt.budget && !/^(off|none|0)$/i.test(opt.budget) && meter.budget === null) { console.error(c.red(`Bad --budget "${opt.budget}". Use a dollar amount, like 5 or 0.50.`)); process.exit(2); }
 const agent = new Agent({ awareness, root, selfDir, model: opt.model, fastModel: opt['fast-model'], isTrusted, sandboxReport, client, meter });
 agent.effort = opt.effort;
+
+let chat = null, savedTurn = null; // the conversation being saved, and the last message already on disk
+function saveChat() {
+  const last = agent.history.at(-1);
+  if (!last || last === savedTurn) return;
+  const meta = chats.save(root, { id: chat?.id, createdAt: chat?.createdAt, model: opt.model, history: agent.history });
+  if (meta) { chat = { id: meta.id, createdAt: meta.createdAt }; savedTurn = last; }
+}
+/** Load a saved conversation into the agent. Returns it, or null if it is missing or damaged. */
+function resumeChat(id) {
+  const saved = chats.load(root, id);
+  if (!saved) return null;
+  agent.history = saved.history;
+  chat = { id: saved.id, createdAt: saved.createdAt };
+  savedTurn = agent.history.at(-1);
+  return saved;
+}
+/** The last few turns of a conversation, one line each. */
+function recap(history, turns = 4) {
+  const one = (t) => { const l = t.replace(/\s+/g, ' ').trim(); return l.length > 160 ? `${l.slice(0, 159)}…` : l; };
+  return displayOf(history).filter((e) => e.role !== 'tool').slice(-turns).map((e) => `  ${e.role === 'you' ? c.dim('you ›') : c.magenta('wake ›')} ${one(e.text)}`).join('\n');
+}
 
 // ======================================================================
 // Headless mode:  awaken -p "add input validation to src/api.js" .
@@ -221,7 +264,13 @@ if (opt.print !== undefined) {
     else console.error(c.yellow('AWAKEN.md is not trusted, so it is being ignored (review it, then pass --trust-notes or run /trust interactively).'));
   }
   if (!isFullySandboxed(sandbox)) console.error(c.yellow(`Not fully sandboxed:\n${sandboxReport}`));
-  const runTool = makeToolRunner({ root, selfDir, awareness, term: headless, autoYes: opt.yes, interactive: false, shell });
+  if (opt.continue) {
+    const latest = chats.list(root)[0];
+    const saved = latest ? resumeChat(latest.id) : null;
+    console.error(c.dim(saved ? `  continuing "${saved.title}" (${latest.messages} messages, ${ago(saved.updatedAt)})` : '  no saved conversation here to continue; starting fresh'));
+  }
+  // Nobody is there to answer, so nothing is relaxed unless asked for: careful by default, --yes for auto.
+  const runTool = makeToolRunner({ root, selfDir, awareness, term: headless, autoYes: opt.yes, approvals: resolveApprovals(opt.approvals) ?? 'careful', allowList, interactive: false, shell });
   const ac = new AbortController();
   process.on('SIGINT', () => ac.abort());
   awareness.feed('code');
@@ -229,6 +278,7 @@ if (opt.print !== undefined) {
     if (cloudShell) await cloudCode(opt.print, { runTool, signal: ac.signal, onText: (t) => process.stdout.write(t), onStatus: (s) => process.stderr.write(c.dim(`  ${s}\n`)) });
     else await agent.converse(opt.print, { mode: 'code', runTool, signal: ac.signal, onText: (t) => process.stdout.write(t) });
     process.stdout.write('\n');
+    saveChat();
     if (meter.requests) process.stderr.write(c.dim(`  cost: about ${meter.short()} (${meter.requests} requests)\n`));
     process.exit(0);
   } catch (e) {
@@ -245,9 +295,12 @@ if (opt.print !== undefined) {
 const term = new Terminal();
 awareness.startSession();
 let quiet = opt.quiet;
-// Session-wide auto-approve: starts from --yes, toggled with /auto. Same rails as --yes
-// (makeToolRunner still asks for destructive commands, high-risk files and unsandboxed code).
-let autoYes = opt.yes;
+// How often it asks: careful | smart | auto (see approvals.js). --yes means auto; /approvals and /auto
+// change it. In every mode makeToolRunner still asks for destructive commands, high-risk files and
+// unsandboxed code.
+let approvals = opt.yes ? 'auto' : resolveApprovals(opt.approvals) ?? DEFAULT_APPROVALS;
+const isAuto = () => approvals === 'auto';
+let lastJournal = null; // the edits of the last task that made any, for /undo
 const cooldownMs = Math.max(0, Number(opt.cooldown) || 0) * 1000;
 let lastHintAt = 0, queued = null, queueTimer = null;
 let watcher;
@@ -337,6 +390,7 @@ async function exclusive(fn) {
     if (term.streaming) { term.write('\n'); term.streaming = false; }
     term.print(c.red(`  error: ${e.message}`) + (explainApiError(e) ? '\n' + c.yellow('  ' + explainApiError(e)) : ''));
   } finally {
+    saveChat(); // session memory: the conversation survives a restart
     currentAbort = null;
     term.busy = false;
     term.rl.setPrompt(prompt());
@@ -344,30 +398,45 @@ async function exclusive(fn) {
   }
 }
 
-const converse = (text, mode) => exclusive(async () => {
+// after({ ok, edited }): called when the task has finished.
+const converse = (text, mode, after) => exclusive(async () => {
   announce(awareness.feed(mode === 'code' ? 'code' : 'ask'));
-  if (mode === 'code' && cloudShell) return runCloudInTerminal(text);
-  await runAgent(agent, text, mode, { root, autoYes }, mode === 'code' ? '\n⚙  working…' : '');
+  if (mode === 'code' && cloudShell) return after?.(await runCloudInTerminal(text));
+  const journal = new EditJournal();
+  const ok = await runAgent(agent, text, mode, { root, approvals: () => approvals, allowList, journal }, mode === 'code' ? '\n⚙  working…' : '');
+  noteEdits(journal);
+  after?.({ ok, edited: journal.files });
 });
+
+function noteEdits(journal) {
+  if (!journal.entries.length) return;
+  lastJournal = journal;
+  term.print(c.dim(`  edited ${journal.files.length} file${journal.files.length === 1 ? '' : 's'}: ${journal.files.slice(0, 6).join(', ')}${journal.files.length > 6 ? ', …' : ''} · /undo puts them back`));
+}
 
 /** /code in the cloud: stream the session here; every returned change goes through local approval. */
 async function runCloudInTerminal(text) {
-  const runTool = makeToolRunner({ root, selfDir, awareness, term, autoYes, shell, signal: currentAbort.signal,
+  const journal = new EditJournal();
+  const runTool = makeToolRunner({ root, selfDir, awareness, term, approvals: () => approvals, allowList, journal, shell, signal: currentAbort.signal,
     onWrite: (rel, content) => { watcher?.noteSelfWrite(rel, content); if (path.normalize(rel) === 'AWAKEN.md') awareness.trustNotes(root, notesHash(content.slice(0, 20_000))); } });
   term.beginStream(c.cyan('\n☁  working in Claude\'s cloud sandbox…'));
   awareness.note('cloudRuns');
+  let ok = false;
   try {
     await cloudCode(text, {
       signal: currentAbort.signal, onText: (t) => term.write(t), onStatus: (s) => term.write(c.dim(`\n  ${s}`)),
       runTool: async (name, input) => { term.streaming = false; try { return await runTool(name, input); } finally { term.streaming = true; } },
     });
+    ok = true;
   } catch (e) {
     const fix = explainApiError(e);
     term.write(currentAbort.signal.aborted ? c.yellow('\n[interrupted — cloud session deleted]') : c.red(`\nerror: ${e.message}`) + (fix ? '\n' + c.yellow('  ' + fix) : ''));
   } finally {
     term.write('\n');
     term.streaming = false;
+    noteEdits(journal);
   }
+  return { ok, edited: journal.files };
 }
 
 function cloudCode(task, { runTool, signal, onText, onStatus }) {
@@ -386,7 +455,14 @@ function cloudCode(task, { runTool, signal, onText, onStatus }) {
 
 // ---------- proactive mode (Lucid and later) ----------
 let proactive = null;
-let lastFinding = null;
+let lastFinding = null, lastFindingId = null;
+// What it reported on its own, and what you did about it (prooflog.js). Published only if you turn that on.
+const proof = new ProofLog(path.join(homeDir(), 'proof-log.json'));
+function publishProof({ quiet = true } = {}) {
+  const r = proof.publish(root, { onWrite: (rel, content) => watcher?.noteSelfWrite(rel, content) });
+  if (!quiet && !r.written && r.reason && !['off', 'unchanged'].includes(r.reason)) term.print(c.yellow(`  Proof log not published: ${r.reason}`));
+  return r;
+}
 const silentTerm = { print() {}, question: async () => 'n' };
 
 if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTIVE ?? '')) { /* disabled */ } else {
@@ -395,13 +471,13 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
   const isFree = () => !term.busy && !term.pending && !term.streaming;
   const show = (kind, text) => {
     if (!isFree()) return void setTimeout(() => show(kind, text), 5000).unref?.();
-    if (kind === 'bugs') lastFinding = text;
+    if (kind === 'bugs') { lastFinding = text; lastFindingId = proof.add({ root, project: path.basename(root), text }).id; publishProof(); }
     const head = {
       bugs: c.yellow('\n🔎 Unprompted — I think I found something:'),
       ideas: c.cyan('\n💭 While you paused, a few ideas:'),
       programs: c.magenta('\n🌱 Ideas for what to build next:'),
     }[kind];
-    const tail = kind === 'bugs' ? c.dim('  /proactive off to silence me') : c.dim('  /code <idea> to start one · /proactive off to silence me');
+    const tail = kind === 'bugs' ? c.dim('  /dismiss if it isn\'t a bug · /proactive off to silence me') : c.dim('  /code <idea> to start one · /proactive off to silence me');
     term.print(`${head}\n${text.replace(/^(?!\s)/gm, '  ')}\n${tail}`);
     if (kind === 'bugs') void offerFix(text);
   };
@@ -409,10 +485,10 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
   // edit or command inside the fix still goes through the normal approval prompts.
   const offerFix = async (text) => {
     try {
-      if (!autoYes) {
-        const ok = await yes('  Fix it now? (each edit still shows a diff and asks)');
+      if (!isAuto()) {
+        const ok = await yes('  Fix it now? (each edit is shown as a diff; your /approvals setting decides what asks)');
         if (!ok) return term.print(c.dim('  ok — /fix later if you change your mind'));
-      } else term.print(c.dim('  /auto is on — fixing it now (destructive or high-risk steps still ask)'));
+      } else term.print(c.dim('  approvals are on auto — fixing it now (destructive or high-risk steps still ask)'));
       if (lastFinding !== text || term.busy) return; // something newer, or you started something meanwhile
       await fixFinding(text);
     } catch (e) { awareness.note('errors', `offerFix: ${e.message}`); }
@@ -437,7 +513,10 @@ if (opt['no-proactive'] || /^(off|0|false|no)$/i.test(process.env.AWAKEN_PROACTI
 
 function fixFinding(text) {
   awareness.note('proactiveFixed');
-  return converse(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${text}`, 'code');
+  const id = lastFinding === text ? lastFindingId : null;
+  if (id && proof.mark(id, 'accepted')) publishProof();
+  return converse(`Fix this bug you found on your own earlier (verify it's real first; if it isn't, say so):\n${text}`, 'code',
+    ({ ok, edited }) => { if (id && ok && edited.length && proof.mark(id, 'fixed')) publishProof(); });
 }
 
 // ---------- self-evolution ----------
@@ -454,7 +533,7 @@ const evolve = (idea) => exclusive(async () => {
   const twin = new Agent({ awareness, root: sandboxDir, selfDir, model: opt.model, fastModel: opt['fast-model'], client: agent.client, sandboxReport });
   // Edits inside the sandbox copy are auto-approved (they can't touch the live version);
   // in evolve mode the agent has no shell — only the confined run_tests tool.
-  const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandboxDir, autoWrites: true, autoCommands: autoYes }, '\n🧬 evolving…');
+  const finished = await runAgent(twin, `Evolve yourself: ${idea}`, 'evolve', { root: sandboxDir, autoWrites: true, autoCommands: isAuto() }, '\n🧬 evolving…');
   if (!finished) return reject(c.dim(`  Evolution abandoned. The sandbox is left at ${sandboxDir}.`));
 
   const symlinks = [];
@@ -584,9 +663,22 @@ async function handle(line) {
       return term.print((isFullySandboxed(sandbox) ? c.green('  ✓ fully sandboxed') : c.yellow('  ⚠ not fully sandboxed')) + '\n' + sandboxReport.replace(/^/gm, '  '));
     case '/status': return term.print(c.magenta(`  ${awareness.describe()}`) + c.dim(`\n  stages: ${STAGES.map((s) => `${s.name}@${s.at}`).join(' → ')}`));
     case '/quiet': quiet = !quiet; return term.print(c.dim(quiet ? '  on-the-fly hints muted' : '  on-the-fly hints on'));
-    case '/clear': agent.history = []; return term.print(c.dim('  conversation cleared (awareness kept)'));
+    case '/clear': agent.history = []; chat = null; savedTurn = null; return term.print(c.dim('  new conversation (the last one is saved: /chats lists them; awareness kept)'));
+    case '/chats': {
+      const l = chats.list(root);
+      return term.print(l.length ? c.dim('  Saved conversations in this project:\n') + l.map((x, i) => `  ${String(i + 1).padStart(2)}. ${x.title}${c.dim(` · ${x.messages} messages · ${ago(x.updatedAt)}${x.id === chat?.id ? ' · current' : ''}`)}`).join('\n') + c.dim('\n  /resume N picks one up · /clear starts a new one') : c.dim('  No saved conversations in this project yet. They are saved as you go.'));
+    }
+    case '/resume': {
+      if (term.busy) return term.print(c.dim('  wait for the current task, or Ctrl+C it first'));
+      const l = chats.list(root);
+      const pick = arg ? l[Number(arg) - 1] : l.find((x) => x.id !== chat?.id) ?? l[0];
+      if (!pick) return term.print(c.dim(arg ? '  No conversation with that number. /chats lists them.' : '  No saved conversation in this project yet.'));
+      const saved = resumeChat(pick.id);
+      if (!saved) return term.print(c.yellow('  That conversation can\'t be opened: its file is missing or damaged.'));
+      return term.print(c.cyan(`  Picked up "${saved.title}" (${pick.messages} messages, ${ago(saved.updatedAt)}). It is sent along with your next message.`) + '\n' + recap(saved.history));
+    }
     case '/forget':
-      if (await yes('Erase its memory of you, permanently?')) { awareness.forget(); agent.history = []; term.rl.setPrompt(prompt()); return term.print(c.dim('  …who are you? (memory erased)')); }
+      if (await yes('Erase its memory of you and every saved conversation, permanently?')) { awareness.forget(); chats.clear(); agent.history = []; chat = null; savedTurn = null; term.rl.setPrompt(prompt()); return term.print(c.dim('  …who are you? (memory and saved conversations erased)')); }
       return term.reprompt();
     case '/genre': case '/role':
       if (awareness.stage.name !== 'Unbound') return term.print(c.dim(`  Professional roles unlock at the Unbound stage. ${awareness.describe()}`));
@@ -639,15 +731,53 @@ async function handle(line) {
     case '/fix':
       if (!lastFinding) return term.print(c.dim('  I haven\'t reported a bug on my own yet. (/code <task> to fix something specific.)'));
       return fixFinding(lastFinding);
-    case '/auto':
-      if (arg === 'on') autoYes = true;
-      else if (arg === 'off') autoYes = false;
-      else if (arg === '') autoYes = !autoYes;
-      else return term.print(c.dim('  usage: /auto [on|off]'));
-      return term.print(autoYes
-        ? c.yellow('  /auto on — I\'ll answer yes to edit and command prompts, and fix bugs I report without asking first.') +
-          c.dim(`\n  Still asks: destructive commands, high-risk files (package.json, hooks, CI, AWAKEN.md)${shell.os || shell.allowUnsandboxed ? '' : ', and code-running commands (no OS sandbox here)'}. /auto off to stop.`)
-        : c.dim('  /auto off — I\'ll ask before every change again.'));
+    case '/dismiss': {
+      if (!lastFindingId) return term.print(c.dim('  I haven\'t reported a bug on my own in this session.'));
+      if (proof.mark(lastFindingId, 'dismissed')) { awareness.note('proactiveDismissed'); publishProof(); }
+      return term.print(c.dim('  Noted: not a bug. It counts as dismissed in the proof log (/proof), and I\'ll check harder before reporting.'));
+    }
+    case '/proof': {
+      if (arg && !['on', 'detail', 'summary', 'off'].includes(arg)) return term.print(c.dim('  usage: /proof [on | summary | off]'));
+      if (arg) {
+        proof.setPublishing(root, arg === 'off' ? null : arg === 'summary' ? 'summary' : 'detail');
+        if (arg !== 'off') {
+          const r = publishProof();
+          if (!r.written && r.reason !== 'unchanged') { proof.setPublishing(root, null); return term.print(c.yellow(`  ${r.reason}`)); }
+        }
+      }
+      const mode = proof.publishing(root), all = proof.stats();
+      return term.print([
+        c.bold('  Proof log: bugs it found on its own'),
+        `  ${proof.summary(root)}`,
+        c.dim(`  All projects: ${all.findings} reported, ${all.asked} fix requests, ${all.dismissed} dismissed.`),
+        c.dim(mode
+          ? `  Publishing is on (${mode === 'summary' ? 'counts only' : 'counts and the list of findings'}): PROOF.md here is rewritten after every report. Commit it to share it. /proof off stops.`
+          : '  Not published. /proof on writes PROOF.md in this project and keeps it up to date (/proof summary: counts only, no file names).'),
+      ].join('\n'));
+    }
+    case '/auto': case '/approvals': {
+      const want = cmd === '/auto' ? (arg === 'on' ? 'auto' : arg === 'off' ? DEFAULT_APPROVALS : arg === '' ? (isAuto() ? DEFAULT_APPROVALS : 'auto') : null) : (arg ? resolveApprovals(arg) : approvals);
+      if (!want) return term.print(c.dim(cmd === '/auto' ? '  usage: /auto [on|off]' : `  usage: /approvals <${APPROVAL_MODES.map((m) => m.id).join('|')}>`));
+      const facts = { ...sandboxFacts(shell), unsandboxedOk: Boolean(shell.allowUnsandboxed) };
+      if (cmd === '/approvals' && !arg) {
+        return term.print(APPROVAL_MODES.map((m) => `  ${m.id === approvals ? c.green('✓') : ' '} ${m.id.padEnd(8)} ${c.dim(`${m.label}: ${m.note}`)}`).join('\n') + '\n' + c.dim(`  ${describeApprovals(approvals, facts)}`));
+      }
+      approvals = want;
+      return term.print((isAuto() ? c.yellow : c.cyan)(`  Approvals: ${approvalsLabel(approvals)}.`) + c.dim(`\n  ${describeApprovals(approvals, facts)}${isAuto() ? '\n  I\'ll also fix bugs I report without asking first. /auto off to stop.' : ''}`));
+    }
+    case '/allowed': {
+      if (arg === 'clear') allowList.remove(root);
+      else if (/^(remove|rm)\s+\S/.test(arg)) allowList.remove(root, arg.replace(/^(remove|rm)\s+/, ''));
+      else if (arg) return term.print(c.dim('  usage: /allowed [clear | remove N]'));
+      const l = allowList.list(root);
+      return term.print(l.length ? c.dim('  Always allowed in this project:\n') + l.map((x, i) => `  ${i + 1}. ${x}`).join('\n') + c.dim('\n  /allowed remove N · /allowed clear') : c.dim('  No commands are always allowed here. When a command asks, answer "a" to always allow that exact command in this project.'));
+    }
+    case '/undo': {
+      if (!lastJournal?.entries.length) return term.print(c.dim('  Nothing to undo: the last task made no edits with its file tools.'));
+      const r = await lastJournal.undo({ onWrite: (rel, content) => watcher?.noteSelfWrite(rel, content) });
+      lastJournal = null;
+      return term.print([r.restored.length && `  put back: ${r.restored.join(', ')}`, r.removed.length && `  removed (it had created them): ${r.removed.join(', ')}`, r.skipped.length && c.yellow(`  left alone because they changed since: ${r.skipped.join(', ')}`)].filter(Boolean).join('\n') || c.dim('  Nothing to undo.'));
+    }
     case '/cost':
       return term.print(meter.report(modelLabel).replace(/^/gm, '  '));
     case '/budget': {
@@ -709,11 +839,20 @@ console.log([
   awareness.state.sessions > 1 && awareness.stageIndex >= 1 ? c.magenta('  (it seems to remember you)') : '',
   c.dim(`  watching ${root} · ${watcher.fileCount()} files · ${awareness.describe()}`),
   c.dim('  save a file for hints · type to ask · /code <task> to build · /help'),
+  c.dim(`  approvals: ${approvalsLabel(approvals).toLowerCase()} · /approvals to change`),
   cloudShell ? c.dim("  ☁  /code runs in Claude's cloud sandbox (Managed Agents) · --shell local to run here") : '',
   isFullySandboxed(sandbox)
     ? c.dim(`  🔒 sandboxed: own process confined · commands in ${sandbox.os.kind === 'sbx' ? 'a Docker Sandbox microVM' : sandbox.os.kind}${sandbox.os.kind === 'sbx' ? '' : opt.net ? ' (network on)' : ', no network'} · /sandbox`)
     : c.yellow(`  ⚠ not fully sandboxed — ${!sandbox.self.active ? (sandbox.failed ? 'self-confinement failed its startup check here, so it runs unconfined' : 'its own process is unconfined') : 'no OS sandbox for commands, so code-running commands will ask'} · /sandbox`),
 ].filter(Boolean).join('\n'));
+{
+  const latest = chats.list(root)[0];
+  if (latest && opt.continue) {
+    const saved = resumeChat(latest.id);
+    console.log(saved ? c.cyan(`  💬 picked up "${saved.title}" (${latest.messages} messages, ${ago(saved.updatedAt)})`) + '\n' + recap(saved.history) : c.yellow('  the last conversation here can\'t be opened (its file is damaged); starting fresh'));
+  } else if (latest) console.log(c.dim(`  💬 last conversation here: "${latest.title}" (${latest.messages} messages, ${ago(latest.updatedAt)}) · /resume to pick it up`));
+  else if (opt.continue) console.log(c.dim('  no saved conversation here to continue; starting fresh'));
+}
 if (agent.notesStatus().state === 'untrusted') console.log(c.yellow('  AWAKEN.md found but not trusted yet — it is ignored until you review it with /trust'));
 if (awareness.stageIndex >= 2) console.log(c.magenta(`\n  ✦ Session ${awareness.state.sessions}. You're back. Let's break something on purpose.\n`));
 rl.prompt();
