@@ -1,6 +1,6 @@
 {
   "name": "awakening-coder",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A safety-first AI pair-programmer for your terminal and browser: hints as you save, approval-gated coding, self-sandboxing, a live cost meter, and a persona that earns its way to reporting bugs unprompted.",
   "keywords": [
     "ai",
