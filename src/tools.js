@@ -1,6 +1,7 @@
 // Tools the coder can use (Claude Code–style): read, search, edit, run commands, track todos,
 // introspect. Everything is sandboxed to one root, secrets are never read, writes are shown
 // as diffs and confirmed, and risky shell commands always ask — even with --yes.
+import vm from 'node:vm';
 import fs from 'node:fs/promises';
 import fss from 'node:fs';
 import path from 'node:path';
@@ -76,12 +77,21 @@ export function globToRegExp(glob) {
     if (ch === '*' && glob[i + 1] === '*') { re += glob[i + 2] === '/' ? '(?:.*/)?' : '.*'; i += glob[i + 2] === '/' ? 2 : 1; }
     else if (ch === '*') re += '[^/]*';
     else if (ch === '?') re += '[^/]';
-    else if (ch === '{') { const end = glob.indexOf('}', i); re += '(?:' + glob.slice(i + 1, end).split(',').map(escapeRe).join('|') + ')'; i = end; }
+    else if (ch === '{' && glob.indexOf('}', i) > i) { const end = glob.indexOf('}', i); re += '(?:' + glob.slice(i + 1, end).split(',').map(escapeRe).join('|') + ')'; i = end; }
     else re += escapeRe(ch);
   }
   return new RegExp('^' + re + '$');
 }
-const escapeRe = (s) => s.replace(/[.+^$()|[\]\\]/g, '\\$&');
+const escapeRe = (s) => s.replace(/[.+^$()|[\]\\{}]/g, '\\$&');
+
+// The grep pattern comes from the model, and so possibly from a prompt-injected file. A pattern like ^(a+)+$
+// backtracks exponentially and would freeze the whole process (web server included), so matching runs in a
+// vm context with a time budget, which V8 can interrupt mid-regex. Works under the permission model too.
+export const GREP_BUDGET_MS = 3000;
+const GREP_MATCH = new vm.Script('lines.reduce((hits, line, i) => (re.test(line) && hits.push(i), hits), [])');
+export function matchLines(re, lines, timeoutMs) {
+  return GREP_MATCH.runInContext(vm.createContext({ re, lines }), { timeout: Math.max(1, Math.floor(timeoutMs)) });
+}
 const posix = (p) => p.split(path.sep).join('/');
 
 /** wrap: { file, args } from sandbox.wrapShell — runs the command inside the OS sandbox instead of a bare shell. */
@@ -298,8 +308,11 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
         try { re = new RegExp(input.pattern, input.ignore_case ? 'i' : ''); } catch (e) { return `Bad regex: ${e.message}`; }
         const filter = input.glob ? globToRegExp(input.glob) : null;
         const out = [];
+        const deadline = Date.now() + GREP_BUDGET_MS;
+        let slow = false;
         for (const f of await listFiles(root, '.', 5000)) {
           if (filter && !filter.test(posix(f))) continue;
+          if (Date.now() >= deadline) { slow = true; break; }
           let text;
           try {
             const st = await fs.stat(path.join(root, f));
@@ -307,10 +320,17 @@ export function makeToolRunner({ root, selfDir, awareness, term, autoYes = false
             text = await fs.readFile(path.join(root, f), 'utf8');
           } catch { continue; }
           if (text.includes('\u0000')) continue; // binary
-          text.split('\n').forEach((line, i) => { if (out.length < 200 && re.test(line)) out.push(`${f}:${i + 1}: ${redactSecrets(line).slice(0, 240)}`); });
+          const lines = text.split('\n');
+          let hits;
+          try { hits = matchLines(re, lines, deadline - Date.now()); } catch (e) {
+            if (e?.code !== 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw e;
+            slow = true; break;
+          }
+          for (const i of hits) { if (out.length >= 200) break; out.push(`${f}:${i + 1}: ${redactSecrets(lines[i]).slice(0, 240)}`); }
           if (out.length >= 200) break;
         }
-        return out.join('\n') || '(no matches)';
+        const note = slow ? `\n[grep stopped after ${GREP_BUDGET_MS / 1000}s: the pattern is too slow (often nested repeats like (a+)+). Simplify it or narrow it with glob.]` : '';
+        return (out.join('\n') || '(no matches)') + note;
       }
 
       case 'read_file': {
