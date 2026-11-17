@@ -433,3 +433,6 @@ test/             offline tests with a fake client (npm test, no API key needed)
 ---
 
 *Save slowly. Let it wake up. Then hold on.*
+
+## For business or Enterprise or Government
+please contact Thomas Yiu, Founder, episteme.ai@proton.me 
